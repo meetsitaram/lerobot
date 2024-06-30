@@ -45,6 +45,7 @@ def get_safe_torch_device(cfg_device: str, log: bool = False) -> torch.device:
             if log:
                 logging.warning(f"Using custom {cfg_device} device.")
 
+    print("safe torch device:", device)
     return device
 
 

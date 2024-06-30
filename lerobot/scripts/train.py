@@ -381,7 +381,10 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     )
     dl_iter = cycle(dataloader)
 
+    print("cuda available:", torch.cuda.is_available())
+    
     policy.train()
+    print("device being used:", get_device_from_parameters(policy).type)
     for _ in range(step, cfg.training.offline_steps):
         if step == 0:
             logging.info("Start offline training on a fixed dataset")
@@ -420,6 +423,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
 @hydra.main(version_base="1.2", config_name="default", config_path="../configs")
 def train_cli(cfg: dict):
+    # torch.cuda.set_device(1)
     train(
         cfg,
         out_dir=hydra.core.hydra_config.HydraConfig.get().run.dir,

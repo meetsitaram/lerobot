@@ -10,7 +10,7 @@ endif
 
 export PATH := $(dir $(PYTHON_PATH)):$(PATH)
 
-DEVICE ?= cpu
+DEVICE ?= gpu
 
 build-cpu:
 	docker build -t lerobot:latest -f docker/lerobot-cpu/Dockerfile .

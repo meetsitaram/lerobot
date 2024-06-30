@@ -16,7 +16,7 @@ hydra:
 # Note that when resuming a run, the default behavior is to use the configuration from the checkpoint,
 # regardless of what's provided with the training command at the time of resumption.
 resume: false
-device: cuda  # cpu
+device: cuda:0  # cpu
 # `use_amp` determines whether to use Automatic Mixed Precision (AMP) for training and evaluation. With AMP,
 # automatic gradient scaling is used.
 use_amp: false
@@ -41,7 +41,7 @@ training:
   save_freq: ???
   log_freq: 250
   save_checkpoint: true
-  num_workers: 4
+  num_workers: 16
   batch_size: ???
 
 eval:
