@@ -92,3 +92,38 @@ configure tasks and add task:
         }
 
 to debug, run train-aloha task and then python debugger - with launch configuration - select our running python process 
+
+
+gazebo robot simulation tool
+activate aloha environment, conda install conda-forge::gazebo and run gazebo.exe 
+
+ros
+xarco, urdf xml files
+Dynamixel servo motors
+
+fusion2urdf 
+https://github.com/syuntoku14/fusion2urdf
+copy fusion2urdf to C:\Users\meets\AppData\Roaming\Autodesk\Autodesk Fusion 360\API\Scripts'
+```sh
+Copy-Item ".\URDF_Exporter\" -Destination "${env:APPDATA}\Autodesk\Autodesk Fusion 360\API\Scripts\" -Recurse 
+Copy-Item ".\URDF_Exporter\" -Destination "${env:APPDATA}\Autodesk\Autodesk Fusion 360\API\Scripts\" -Recurse -force
+```
+
+ros-install
+https://docs.ros.org/en/jazzy/Installation/Windows-Install-Binary.html
+
+
+### rosrun to get urdf from xacro 
+in ubuntu
+https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debians.html
+```
+source /opt/ros/jazzy/setup.bash
+sudo apt-get install ros-jazzy-xacro
+ros2 run xacro xacro Basic_Robot.xacro --inorder > Basic_Robot.urdf
+```
+in windows
+```
+pip install mujoco-python-viewer
+python -m mujoco.viewer --mjcf=./Basic_Robot.urdf
+# from the viewer, save xml and mfb
+```
