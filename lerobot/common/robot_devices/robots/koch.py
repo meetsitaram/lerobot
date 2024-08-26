@@ -171,6 +171,11 @@ class KochRobotConfig:
     # gripper is not put in torque mode.
     gripper_open_degree: float | None = None
 
+    # Optionally set the leader arm in torque mode with the gripper motor set to this angle. This makes it
+    # possible to squeeze the gripper and have it spring back to an open position on its own. If None, the
+    # gripper is not put in torque mode.
+    gripper_open_degree: float | None = None
+
 
 class KochRobot:
     # TODO(rcadene): Implement force feedback
