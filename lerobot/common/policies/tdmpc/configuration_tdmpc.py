@@ -167,7 +167,8 @@ class TDMPCConfig:
             raise ValueError(
                 f"{self.__class__.__name__} handles at most one image for now. Got image keys {image_keys}."
             )
-        if len(image_keys) > 0:
+        # Only square images are handled if random shift is used.
+        if self.max_random_shift_ratio > 0 and len(image_keys) > 0:
             image_key = next(iter(image_keys))
             if self.input_shapes[image_key][-2] != self.input_shapes[image_key][-1]:
                 # TODO(alexander-soare): This limitation is solely because of code in the random shift

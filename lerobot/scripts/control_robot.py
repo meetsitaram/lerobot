@@ -107,11 +107,13 @@ import platform
 import shutil
 import time
 import traceback
+from collections import defaultdict
 from contextlib import nullcontext
 from functools import cache
 from pathlib import Path
 
 import cv2
+import numpy as np
 import torch
 import tqdm
 from omegaconf import DictConfig
@@ -129,6 +131,7 @@ from lerobot.common.policies.factory import make_policy
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.utils import Robot
 from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
+from lerobot.common.vision import GoalSetter, HSVSegmenter
 from lerobot.scripts.eval import get_pretrained_policy_path
 from lerobot.scripts.push_dataset_to_hub import (
     push_dataset_card_to_hub,
@@ -140,6 +143,27 @@ from lerobot.scripts.push_dataset_to_hub import (
 ########################################################################################
 # Utilities
 ########################################################################################
+
+
+def calc_reward(obj_mask, goal_mask, distance_reward_coeff: float = 1.0):
+    intersection_area = np.count_nonzero(np.bitwise_and(obj_mask, goal_mask))
+
+    if intersection_area <= 0:
+        # Find the minimum distance between the object and the goal.
+        goal_contour = cv2.findContours(
+            goal_mask.astype(np.uint8), mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_SIMPLE
+        )[0]
+        obj_contour = cv2.findContours(
+            obj_mask.astype(np.uint8), mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_SIMPLE
+        )[0]
+        obj_points = np.vstack(obj_contour).squeeze()  # shape (N, 2)
+        goal_points = np.vstack(goal_contour).squeeze()  # shape (M, 2)
+        distances = np.linalg.norm(obj_points[:, None] - goal_points[None, :], axis=-1)  # shape (N, M, 2)
+        reward = -np.min(distances) * distance_reward_coeff
+    elif intersection_area > 0:
+        reward = intersection_area / np.count_nonzero(obj_mask)
+
+    return reward
 
 
 def say(text, blocking=False):
@@ -418,6 +442,10 @@ def record(
 
         timestamp = time.perf_counter() - start_warmup_t
 
+    segmenter = HSVSegmenter()
+    goal_setter = GoalSetter.from_mask_file("outputs/goal_mask.npy")
+    goal_mask = goal_setter.get_goal_mask()
+    where_goal = np.where(goal_mask > 0)
     # Save images using threads to reach high fps (30 and more)
     # Using `with` to exist smoothly if an execption is raised.
     # Using only 4 worker threads to avoid blocking the main thread.
@@ -427,7 +455,7 @@ def record(
         while episode_index < num_episodes:
             logging.info(f"Recording episode {episode_index}")
             say(f"Recording episode {episode_index}")
-            ep_dict = {}
+            ep_dict = defaultdict(list)
             frame_index = 0
             timestamp = 0
             start_episode_t = time.perf_counter()
@@ -452,7 +480,31 @@ def record(
                 if not is_headless():
                     image_keys = [key for key in observation if "image" in key]
                     for key in image_keys:
-                        cv2.imshow(key, cv2.cvtColor(observation[key].numpy(), cv2.COLOR_RGB2BGR))
+                        img = observation[key].numpy()
+                        obj_mask, annotated_img = segmenter.segment(img)
+                        reward = calc_reward(obj_mask, goal_mask, 1 / 80)
+                        annotated_img[where_goal] = (
+                            annotated_img[where_goal]
+                            - (annotated_img[where_goal] - np.array([255, 255, 255])) // 2
+                        )
+                        annotated_img = cv2.resize(annotated_img, (640, 480))
+                        cv2.putText(
+                            annotated_img,
+                            org=(10, 25),
+                            color=(255, 255, 255),
+                            text=f"{reward=:.3f}",
+                            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                            fontScale=1,
+                            thickness=1,
+                        )
+                        cv2.imshow(key, cv2.cvtColor(annotated_img, cv2.COLOR_RGB2BGR))
+                        ep_dict["next.reward"].append(reward)
+                        if reward == 1:
+                            ep_dict["next.success"].append(True)
+                            say("Goal accomplished.", blocking=True)
+                            exit_early = True
+                        else:
+                            ep_dict["next.success"].append(False)
                     cv2.waitKey(1)
 
                 for key in not_image_keys:
@@ -511,6 +563,13 @@ def record(
                 # Start resetting env while the executor are finishing
                 logging.info("Reset the environment")
                 say("Reset the environment")
+                while not exit_early:
+                    start = time.perf_counter()
+                    robot.teleop_step()
+                    busy_wait(1 / fps - (time.perf_counter() - start))
+                    if exit_early:
+                        exit_early = False
+                        break
 
             timestamp = 0
             start_vencod_t = time.perf_counter()

@@ -18,7 +18,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from copy import deepcopy
-from pathlib import Path
 from pprint import pformat
 from threading import Lock
 
@@ -44,6 +43,8 @@ from lerobot.common.logger import Logger, log_output_dir
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.policies.policy_protocol import PolicyWithUpdate
 from lerobot.common.policies.utils import get_device_from_parameters
+from lerobot.common.robot_devices.robots.factory import make_robot
+from lerobot.common.robot_devices.robots.koch import KochRobot
 from lerobot.common.utils.utils import (
     format_big_number,
     get_safe_torch_device,
@@ -51,7 +52,8 @@ from lerobot.common.utils.utils import (
     init_logging,
     set_global_seed,
 )
-from lerobot.scripts.eval import eval_policy
+
+CLIP = 20.0
 
 
 def make_optimizer_and_scheduler(cfg, policy):
@@ -237,6 +239,10 @@ def log_eval_info(logger, info, step, cfg, dataset, is_online):
     logger.log_dict(info, step, mode="eval")
 
 
+def eval_policy(robot: KochRobot):
+    pass
+
+
 def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
     if out_dir is None:
         raise NotImplementedError()
@@ -366,14 +372,15 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             logging.info(f"Eval policy at step {step}")
             with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.use_amp else nullcontext():
                 assert eval_env is not None
-                eval_info = eval_policy(
-                    eval_env,
-                    policy,
-                    cfg.eval.n_episodes,
-                    videos_dir=Path(out_dir) / "eval" / f"videos_step_{step_identifier}",
-                    max_episodes_rendered=4,
-                    start_seed=cfg.seed,
-                )
+                eval_info = eval_policy(robot)
+                # eval_info = eval_policy(
+                #     eval_env,
+                #     policy,
+                #     cfg.eval.n_episodes,
+                #     videos_dir=Path(out_dir) / "eval" / f"videos_step_{step_identifier}",
+                #     max_episodes_rendered=4,
+                #     start_seed=cfg.seed,
+                # )
             log_eval_info(logger, eval_info["aggregated"], step, cfg, offline_dataset, is_online=is_online)
             if cfg.wandb.enable:
                 logger.log_video(eval_info["video_paths"][0], step, mode="eval")
@@ -452,11 +459,15 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                 episode_data = {}
                 for k in episode_frames[0]:
                     episode_data[k] = torch.stack([frame[k] for frame in episode_frames])
-                # Zero the episode index and data index. This is a requirement of the `add_data` method.
                 episode_data[OnlineBuffer.EPISODE_INDEX_KEY] *= 0
                 episode_data[OnlineBuffer.INDEX_KEY] = (
                     episode_data[OnlineBuffer.INDEX_KEY] - episode_data[OnlineBuffer.INDEX_KEY][0]
                 )
+                episode_data["action"] = np.diff(
+                    episode_data["action"], axis=0, prepend=episode_data["action"][:1]
+                )
+                episode_data["action"] /= CLIP
+                episode_data["action"] = np.clip(episode_data["action"], -1.0, 1.0)
                 offline_dataset_cache.add_data(episode_data)
                 episode_index += 1
                 episode_frames = []
@@ -532,7 +543,10 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     # Online training.
 
     # Create an env dedicated to online episodes collection from policy rollout.
-    online_env = make_env(cfg, n_envs=cfg.training.online_rollout_batch_size)
+    # online_env = make_env(cfg, n_envs=cfg.training.online_rollout_batch_size)
+    robot: KochRobot = make_robot(init_hydra_config("lerobot/configs/robot/koch_.yaml"))
+    robot.connect()
+
     online_buffer_path = logger.log_dir / "online_buffer"
     if cfg.resume and not online_buffer_path.exists():
         # If we are resuming a run, we default to the data shapes and buffer capacity from the saved online
@@ -553,7 +567,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             "next.success": {"shape": (), "dtype": np.dtype("?")},
         },
         buffer_capacity=cfg.training.online_buffer_capacity,
-        fps=online_env.unwrapped.metadata["render_fps"],
+        fps=30,  # online_env.unwrapped.metadata["render_fps"],
         delta_timestamps=cfg.training.delta_timestamps,
     )
 
@@ -616,17 +630,18 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             online_rollout_policy.eval()
             start_rollout_time = time.perf_counter()
             with torch.no_grad():
-                eval_info = eval_policy(
-                    online_env,
-                    online_rollout_policy,
-                    n_episodes=cfg.training.online_rollout_n_episodes,
-                    max_episodes_rendered=min(10, cfg.training.online_rollout_n_episodes),
-                    videos_dir=logger.log_dir / "online_rollout_videos",
-                    return_episode_data=True,
-                    start_seed=(
-                        rollout_start_seed := (rollout_start_seed + cfg.training.batch_size) % 1000000
-                    ),
-                )
+                eval_info = eval_policy(robot)
+                # eval_info = eval_policy(
+                #     online_env,
+                #     online_rollout_policy,
+                #     n_episodes=cfg.training.online_rollout_n_episodes,
+                #     max_episodes_rendered=min(10, cfg.training.online_rollout_n_episodes),
+                #     videos_dir=logger.log_dir / "online_rollout_videos",
+                #     return_episode_data=True,
+                #     start_seed=(
+                #         rollout_start_seed := (rollout_start_seed + cfg.training.batch_size) % 1000000
+                #     ),
+                # )
             online_rollout_s = time.perf_counter() - start_rollout_time
 
             with lock:
