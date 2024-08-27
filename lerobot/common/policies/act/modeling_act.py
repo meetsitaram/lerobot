@@ -95,6 +95,14 @@ class ACTPolicy(
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
 
+    @property
+    def n_obs_steps(self) -> int:
+        return self.config.n_obs_steps
+
+    @property
+    def input_keys(self) -> set[str]:
+        return set(self.config.input_shapes)
+
     @torch.no_grad
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
@@ -130,6 +138,23 @@ class ACTPolicy(
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
+
+    @torch.no_grad
+    def run_inference(self, observation_batch: dict[str, Tensor]) -> Tensor:
+        self.eval()
+        observation_batch = self.normalize_inputs(observation_batch)
+        # TODO(now): fix this. Removing temporal dim here as model can't take it. Dunno how it snuck in.
+        observation_batch = dict(observation_batch)
+        for k in observation_batch:
+            observation_batch[k] = observation_batch[k].squeeze(dim=1)
+        if len(self.expected_image_keys) > 0:
+            observation_batch = dict(observation_batch)
+            observation_batch["observation.images"] = torch.stack(
+                [observation_batch[k] for k in self.expected_image_keys], dim=-4
+            )
+        actions = self.model(observation_batch)[0]
+        actions = self.unnormalize_outputs({"action": actions})["action"]
+        return actions[:, : self.config.n_action_steps]
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Run the batch through the model and compute the loss for training or validation."""
