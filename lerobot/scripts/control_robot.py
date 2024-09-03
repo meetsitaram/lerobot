@@ -128,6 +128,7 @@ from lerobot.common.datasets.push_dataset_to_hub.utils import concatenate_episod
 from lerobot.common.datasets.utils import calculate_episode_data_index, create_branch
 from lerobot.common.datasets.video_utils import encode_video_frames
 from lerobot.common.policies.factory import make_policy
+from lerobot.common.rl import calc_reward
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.utils import Robot
 from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
@@ -143,27 +144,6 @@ from lerobot.scripts.push_dataset_to_hub import (
 ########################################################################################
 # Utilities
 ########################################################################################
-
-
-def calc_reward(obj_mask, goal_mask, distance_reward_coeff: float = 1.0):
-    intersection_area = np.count_nonzero(np.bitwise_and(obj_mask, goal_mask))
-
-    if intersection_area <= 0:
-        # Find the minimum distance between the object and the goal.
-        goal_contour = cv2.findContours(
-            goal_mask.astype(np.uint8), mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_SIMPLE
-        )[0]
-        obj_contour = cv2.findContours(
-            obj_mask.astype(np.uint8), mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_SIMPLE
-        )[0]
-        obj_points = np.vstack(obj_contour).squeeze()  # shape (N, 2)
-        goal_points = np.vstack(goal_contour).squeeze()  # shape (M, 2)
-        distances = np.linalg.norm(obj_points[:, None] - goal_points[None, :], axis=-1)  # shape (N, M, 2)
-        reward = -np.min(distances) * distance_reward_coeff
-    elif intersection_area > 0:
-        reward = intersection_area / np.count_nonzero(obj_mask)
-
-    return reward
 
 
 def say(text, blocking=False):
@@ -492,7 +472,9 @@ def record(
                     for key in image_keys:
                         img = observation[key].numpy()
                         obj_mask, annotated_img = segmenter.segment(img)
-                        reward = calc_reward(obj_mask, goal_mask, 1 / 80)
+                        reward, success = calc_reward(
+                            obj_mask, goal_mask, (action["action"] - observation["observation.state"]).numpy()
+                        )
                         annotated_img[where_goal] = (
                             annotated_img[where_goal]
                             - (annotated_img[where_goal] - np.array([255, 255, 255])) // 2
@@ -509,12 +491,10 @@ def record(
                         )
                         cv2.imshow(key, cv2.cvtColor(annotated_img, cv2.COLOR_RGB2BGR))
                         ep_dict["next.reward"].append(reward)
-                        if reward == 1:
-                            ep_dict["next.success"].append(True)
+                        ep_dict["next.success"].append(success)
+                        if success:
                             say("Goal accomplished.", blocking=True)
                             exit_early = True
-                        else:
-                            ep_dict["next.success"].append(False)
                     cv2.waitKey(1)
 
                 for key in not_image_keys:

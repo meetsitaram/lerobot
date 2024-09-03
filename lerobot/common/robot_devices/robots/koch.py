@@ -520,7 +520,7 @@ class KochRobot:
             obs_dict[f"observation.images.{name}"] = torch.from_numpy(images[name])
         return obs_dict
 
-    def send_action(self, action: torch.Tensor, follower_names: list[str] | None = None):
+    def send_action(self, action: torch.Tensor, follower_names: list[str] | None = None) -> torch.Tensor:
         """Command the follower arms to move to a target joint configuration.
 
         The relative action magnitude may be clipped depending on the configuration parameter
@@ -572,6 +572,8 @@ class KochRobot:
 
         for name in self.follower_arms:
             self.follower_arms[name].write("Goal_Position", follower_goal_pos[name].astype(np.int32))
+
+        return safe_action
 
     def disconnect(self):
         if not self.is_connected:

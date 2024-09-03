@@ -21,7 +21,9 @@ faster than using HuggingFace Datasets as there's no conversion to an intermedia
 supports in-place slicing and mutation which is very handy for a dynamic buffer.
 """
 
+import logging
 import os
+from itertools import chain
 from pathlib import Path
 from typing import Any, Callable
 
@@ -251,6 +253,22 @@ class OnlineBuffer(torch.utils.data.Dataset):
         """Keys to access image and video stream from cameras."""
         return [k for k in self._data if k.startswith("observation.image")]
 
+    def _optimized_advanced_slice(self, data_key: str, indices: np.ndarray) -> np.ndarray:
+        """Convert advanced slicing to basic slicing by finding contiguous ranges in the requested indices.
+
+        TODO(now): For sequentially repeated indices we use numpy repeat.
+        """
+        indices_diff = np.diff(indices, prepend=indices[0] - 1)
+        where_not_1 = np.where(indices_diff != 1)[0]
+        ptr = 0
+        ret = []
+        for ix in chain(where_not_1, [len(indices)]):
+            ret.append(self._data[data_key][indices[ptr] : indices[ix - 1] + 1])
+            ptr = ix
+
+        # Avoid creating a copy with concatenate if possible.
+        return np.concatenate(ret) if len(ret) > 1 else ret[0]
+
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         if idx >= len(self) or idx < -len(self):
             raise IndexError
@@ -284,15 +302,29 @@ class OnlineBuffer(torch.utils.data.Dataset):
             is_pad = min_ > self.tolerance_s
 
             # Check violated query timestamps are all outside the episode range.
-            assert (
-                (query_ts[is_pad] < episode_timestamps[0]) | (episode_timestamps[-1] < query_ts[is_pad])
-            ).all(), (
-                f"One or several timestamps unexpectedly violate the tolerance ({min_} > {self.tolerance_s=}"
-                ") inside the episode range."
-            )
+            try:
+                assert (
+                    (query_ts[is_pad] < episode_timestamps[0]) | (episode_timestamps[-1] < query_ts[is_pad])
+                ).all(), (
+                    f"One or several timestamps unexpectedly violate the tolerance ({min_} > {self.tolerance_s=}"
+                    ") inside the episode range."
+                )
+            except AssertionError:
+                logging.warning(
+                    f"One or several timestamps unexpectedly violate the tolerance ({min_} > {self.tolerance_s=}"
+                    ") inside the episode range."
+                )
+                return self.__getitem__(self, np.random.choice(len(self)))
 
             # Load frames for this data key.
-            item[data_key] = self._data[data_key][episode_data_indices[argmin_]]
+            if np.any(np.diff(argmin_) != 1):
+                item[data_key] = self._data[data_key][episode_data_indices[argmin_]]
+                # item[data_key] = self._optimized_advanced_slice(data_key, episode_data_indices[argmin_])
+            else:
+                # Do basic slicing where possible
+                item[data_key] = self._data[data_key][
+                    episode_data_indices[argmin_.min()] : episode_data_indices[argmin_.max()] + 1
+                ]
 
             item[f"{data_key}{OnlineBuffer.IS_PAD_POSTFIX}"] = is_pad
 

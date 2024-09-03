@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from copy import deepcopy
 
 import torch
+from termcolor import colored
 from torch import Tensor
 
 from lerobot.common.policies.policy_protocol import Policy
@@ -66,8 +67,7 @@ class PolicyRolloutWrapper:
 
         self.reset()
 
-    def __del__(self):
-        """TODO(now): This isn't really working. Runtime exits with an exception."""
+    def close_thread(self):
         self._threadpool_executor.shutdown(wait=True, cancel_futures=True)
 
     def reset(self):
@@ -150,7 +150,7 @@ class PolicyRolloutWrapper:
             )
 
         inference_time = time.perf_counter() - start_inference_t
-        # logging.info(f"Inference time: {inference_time * 1000 :.0f} ms")
+        logging.info(f"Inference time: {inference_time * 1000 :.0f} ms")
         if inference_time > (self.n_action_buffer * self.period_us + self.period_us) / MICROSEC:
             logging.warning(
                 "Inference is taking longer than your buffer.\n"
@@ -233,7 +233,7 @@ class PolicyRolloutWrapper:
         del first_action_timestamp  # defensive against accidentally using the seconds version
 
         # Update observation cache.
-        if not set(observation_batch).issubset(self.policy.input_keys):
+        if not set(self.policy.input_keys).issubset(observation_batch):
             raise ValueError(
                 f"Missing observation_keys: {set(self.policy.input_keys).difference(set(observation_batch))}"
             )
@@ -274,7 +274,9 @@ class PolicyRolloutWrapper:
                 self._future.result(timeout=timeout_)
             except TimeoutError:
                 if ret is None:
-                    logging.warning("Your inference is begining to fall behind your rollout loop!")
+                    logging.warning(
+                        colored("Your inference is begining to fall behind your rollout loop!", "yellow")
+                    )
                 return ret
 
         # Start the inference job.

@@ -93,14 +93,18 @@ class TDMPCPolicy(
             )
         else:
             self.normalize_inputs = nn.Identity()
-        self.normalize_targets = Normalize(
-            config.output_shapes, config.output_normalization_modes, dataset_stats
-        )
-        self.unnormalize_outputs = Unnormalize(
-            config.output_shapes, config.output_normalization_modes, dataset_stats
-        )
+        if config.output_normalization_modes is not None:
+            self.normalize_targets = Normalize(
+                config.output_shapes, config.output_normalization_modes, dataset_stats
+            )
+            self.unnormalize_outputs = Unnormalize(
+                config.output_shapes, config.output_normalization_modes, dataset_stats
+            )
+        else:
+            self.normalize_targets = nn.Identity()
+            self.unnormalize_outputs = nn.Identity()
 
-        image_keys = [k for k in config.input_shapes if k.startswith("observation.image")]
+        image_keys = [k for k in config.input_shapes if k.startswith("observation.images.webcam")]
         # Note: This check is covered in the post-init of the config but have a sanity check just in case.
         self._use_image = False
         self._use_env_state = False
@@ -113,6 +117,14 @@ class TDMPCPolicy(
 
         self.reset()
 
+    @property
+    def n_obs_steps(self) -> int:
+        return 1
+
+    @property
+    def input_keys(self) -> set[str]:
+        return set(self.config.input_shapes)
+
     def reset(self):
         """
         Clear observation and action queues. Clear previous means for warm starting of MPPI/CEM. Should be
@@ -123,12 +135,46 @@ class TDMPCPolicy(
             "action": deque(maxlen=max(self.config.n_action_steps, self.config.n_action_repeats)),
         }
         if self._use_image:
-            self._queues["observation.image"] = deque(maxlen=1)
+            self._queues["observation.images.webcam"] = deque(maxlen=1)
         if self._use_env_state:
             self._queues["observation.environment_state"] = deque(maxlen=1)
         # Previous mean obtained from the cross-entropy method (CEM) used during MPC. It is used to warm start
         # CEM for the next step.
         self._prev_mean: torch.Tensor | None = None
+
+    @torch.no_grad
+    def run_inference(self, observation_batch: dict[str, Tensor]) -> Tensor:
+        """Select a single action given environment observations."""
+        observation_batch = self.normalize_inputs(observation_batch)
+        if self._use_image:
+            observation_batch = dict(
+                observation_batch
+            )  # shallow copy so that adding a key doesn't modify the original
+            observation_batch["observation.images.webcam"] = observation_batch[self.input_image_key]
+
+        # Remove the time dimensions as it is not handled yet.
+        for key in observation_batch:
+            assert observation_batch[key].shape[1] == 1
+            observation_batch[key] = observation_batch[key][:, 0]
+
+        # NOTE: Order of observations matters here.
+        encode_keys = []
+        if self._use_image:
+            encode_keys.append("observation.images.webcam")
+        if self._use_env_state:
+            encode_keys.append("observation.environment_state")
+        encode_keys.append("observation.state")
+        z = self.model.encode({k: observation_batch[k] for k in encode_keys})
+        if self.config.use_mpc:  # noqa: SIM108
+            actions = self.plan(z)  # (horizon, batch, action_dim)
+        else:
+            # Plan with the policy (π) alone. This always returns one action so unsqueeze to get a
+            # sequence dimension like in the MPC branch.
+            actions = self.model.pi(z).unsqueeze(0)
+
+        actions = torch.clamp(actions, -1, +1)
+        actions = self.unnormalize_outputs({"action": actions})["action"]
+        return actions.permute(1, 0, 2)  # (batch, seq, action_dim)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -136,7 +182,7 @@ class TDMPCPolicy(
         batch = self.normalize_inputs(batch)
         if self._use_image:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch["observation.image"] = batch[self.input_image_key]
+            batch["observation.images.webcam"] = batch[self.input_image_key]
 
         self._queues = populate_queues(self._queues, batch)
 
@@ -152,7 +198,7 @@ class TDMPCPolicy(
             # NOTE: Order of observations matters here.
             encode_keys = []
             if self._use_image:
-                encode_keys.append("observation.image")
+                encode_keys.append("observation.images.webcam")
             if self._use_env_state:
                 encode_keys.append("observation.environment_state")
             encode_keys.append("observation.state")
@@ -332,7 +378,7 @@ class TDMPCPolicy(
         batch = self.normalize_inputs(batch)
         if self._use_image:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch["observation.image"] = batch[self.input_image_key]
+            batch["observation.images.webcam"] = batch[self.input_image_key]
         batch = self.normalize_targets(batch)
 
         info = {}
@@ -348,9 +394,9 @@ class TDMPCPolicy(
 
         # Apply random image augmentations.
         if self._use_image and self.config.max_random_shift_ratio > 0:
-            observations["observation.image"] = flatten_forward_unflatten(
+            observations["observation.images.webcam"] = flatten_forward_unflatten(
                 partial(random_shifts_aug, max_random_shift_ratio=self.config.max_random_shift_ratio),
-                observations["observation.image"],
+                observations["observation.images.webcam"],
             )
 
         # Get the current observation for predicting trajectories, and all future observations for use in
@@ -360,7 +406,7 @@ class TDMPCPolicy(
             current_observation[k] = observations[k][0]
             next_observations[k] = observations[k][1:]
         horizon, batch_size = next_observations[
-            "observation.image" if self._use_image else "observation.environment_state"
+            "observation.images.webcam" if self._use_image else "observation.state"
         ].shape[:2]
 
         # Run latent rollout using the latent dynamics model and policy model.
@@ -714,10 +760,13 @@ class TDMPCObservationEncoder(nn.Module):
         super().__init__()
         self.config = config
 
-        if "observation.image" in config.input_shapes:
+        if "observation.images.webcam" in config.input_shapes:
             self.image_enc_layers = nn.Sequential(
                 nn.Conv2d(
-                    config.input_shapes["observation.image"][0], config.image_encoder_hidden_dim, 7, stride=2
+                    config.input_shapes["observation.images.webcam"][0],
+                    config.image_encoder_hidden_dim,
+                    7,
+                    stride=2,
                 ),
                 nn.ReLU(),
                 nn.Conv2d(config.image_encoder_hidden_dim, config.image_encoder_hidden_dim, 5, stride=2),
@@ -727,7 +776,7 @@ class TDMPCObservationEncoder(nn.Module):
                 nn.Conv2d(config.image_encoder_hidden_dim, config.image_encoder_hidden_dim, 3, stride=2),
                 nn.ReLU(),
             )
-            dummy_batch = torch.zeros(1, *config.input_shapes["observation.image"])
+            dummy_batch = torch.zeros(1, *config.input_shapes["observation.images.webcam"])
             with torch.inference_mode():
                 out_shape = self.image_enc_layers(dummy_batch).shape[1:]
             self.image_enc_layers.extend(
@@ -765,8 +814,10 @@ class TDMPCObservationEncoder(nn.Module):
         """
         feat = []
         # NOTE: Order of observations matters here.
-        if "observation.image" in self.config.input_shapes:
-            feat.append(flatten_forward_unflatten(self.image_enc_layers, obs_dict["observation.image"]))
+        if "observation.images.webcam" in self.config.input_shapes:
+            feat.append(
+                flatten_forward_unflatten(self.image_enc_layers, obs_dict["observation.images.webcam"])
+            )
         if "observation.environment_state" in self.config.input_shapes:
             feat.append(self.env_state_enc_layers(obs_dict["observation.environment_state"]))
         if "observation.state" in self.config.input_shapes:

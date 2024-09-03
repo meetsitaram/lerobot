@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import os
+import platform
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -43,6 +45,7 @@ from lerobot.common.logger import Logger, log_output_dir
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.policies.policy_protocol import PolicyWithUpdate
 from lerobot.common.policies.utils import get_device_from_parameters
+from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.koch import KochRobot
 from lerobot.common.utils.utils import (
@@ -52,8 +55,10 @@ from lerobot.common.utils.utils import (
     init_logging,
     set_global_seed,
 )
+from lerobot.scripts.eval_real import rollout
 
-CLIP = 20.0
+CLIP = np.array([5, 8, 6, 6, 6, 2])
+FPS = 20.0
 
 
 def make_optimizer_and_scheduler(cfg, policy):
@@ -239,8 +244,63 @@ def log_eval_info(logger, info, step, cfg, dataset, is_online):
     logger.log_dict(info, step, mode="eval")
 
 
-def eval_policy(robot: KochRobot):
-    pass
+def say(text, blocking=False):
+    # Check if mac, linux, or windows.
+    if platform.system() == "Darwin":
+        cmd = f'say "{text}"'
+    elif platform.system() == "Linux":
+        cmd = f'spd-say "{text}"'
+    elif platform.system() == "Windows":
+        cmd = (
+            'PowerShell -Command "Add-Type -AssemblyName System.Speech; '
+            f"(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{text}')\""
+        )
+
+    if not blocking and platform.system() in ["Darwin", "Linux"]:
+        # TODO(rcadene): Make it work for Windows
+        # Use the ampersand to run command in the background
+        cmd += " &"
+
+    os.system(cmd)
+
+
+eval_clip = CLIP.max()
+eval_max_steps = 25
+
+
+def eval_policy(robot: KochRobot, policy, n_action_buffer):
+    global eval_clip
+    global eval_max_steps
+    say("Help me please")
+    while True:
+        try:  # noqa: SIM105
+            res = input("clip size\n")
+            if len(res) > 0:
+                eval_clip = float(res)
+        except ValueError:
+            pass
+        break
+    while True:
+        try:  # noqa: SIM105
+            res = input("max steps\n")
+            if len(res) > 0:
+                eval_max_steps = int(res)
+        except ValueError:
+            pass
+        break
+    robot.follower_arms["main"].write("Torque_Enable", TorqueMode.ENABLED.value)
+    eval_info = rollout(
+        robot,
+        policy,
+        FPS,
+        visualize=True,
+        warmup_s=1,
+        relative_actions_max=eval_clip,
+        max_steps=eval_max_steps,
+        n_action_buffer=n_action_buffer,
+    )
+    robot.follower_arms["main"].write("Torque_Enable", TorqueMode.DISABLED.value)
+    return eval_info
 
 
 def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
@@ -372,7 +432,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             logging.info(f"Eval policy at step {step}")
             with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.use_amp else nullcontext():
                 assert eval_env is not None
-                eval_info = eval_policy(robot)
+                eval_info = eval_policy(robot, policy, cfg.eval.n_action_buffer)
                 # eval_info = eval_policy(
                 #     eval_env,
                 #     policy,
@@ -453,12 +513,13 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                 offline_dataset.tolerance_s,
                 offline_dataset.video_backend,
             )
-            episode_frames.append(frame)
             # Add data to the cache when a full episode has been gathered.
             if frame["episode_index"] > episode_index or i == len(offline_dataset) - 1:
+                if i == len(offline_dataset) - 1:
+                    episode_frames.append(frame)
                 episode_data = {}
                 for k in episode_frames[0]:
-                    episode_data[k] = torch.stack([frame[k] for frame in episode_frames])
+                    episode_data[k] = torch.stack([f[k] for f in episode_frames])
                 episode_data[OnlineBuffer.EPISODE_INDEX_KEY] *= 0
                 episode_data[OnlineBuffer.INDEX_KEY] = (
                     episode_data[OnlineBuffer.INDEX_KEY] - episode_data[OnlineBuffer.INDEX_KEY][0]
@@ -466,11 +527,11 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                 episode_data["action"] = np.diff(
                     episode_data["action"], axis=0, prepend=episode_data["action"][:1]
                 )
-                episode_data["action"] /= CLIP
-                episode_data["action"] = np.clip(episode_data["action"], -1.0, 1.0)
+                episode_data["action"] = np.clip(episode_data["action"], -CLIP, CLIP)
                 offline_dataset_cache.add_data(episode_data)
                 episode_index += 1
                 episode_frames = []
+            episode_frames.append(frame)
         # Sanity check to make sure we copied all data.
         assert offline_dataset_cache.num_samples == len(offline_dataset)
         # Re-enable image transforms in offline dataset (which we disabled before to siphon the
@@ -491,6 +552,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     dataloader = torch.utils.data.DataLoader(
         offline_dataset_cache if cfg.training.use_offline_dataset_cache else offline_dataset,
         num_workers=cfg.training.num_workers,
+        persistent_workers=cfg.training.num_workers > 0,
         batch_size=cfg.training.batch_size,
         shuffle=shuffle,
         sampler=sampler,
@@ -567,9 +629,16 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             "next.success": {"shape": (), "dtype": np.dtype("?")},
         },
         buffer_capacity=cfg.training.online_buffer_capacity,
-        fps=30,  # online_env.unwrapped.metadata["render_fps"],
+        fps=FPS,  # online_env.unwrapped.metadata["render_fps"],
         delta_timestamps=cfg.training.delta_timestamps,
     )
+    # TODO(now): Hack
+    for k in online_dataset._data:
+        if k == OnlineBuffer.NEXT_INDEX_KEY:
+            online_dataset._data[k] = len(offline_dataset_cache)
+        else:
+            fill = offline_dataset_cache._data[k]
+            online_dataset._data[k][: len(fill)] = offline_dataset_cache._data[k]
 
     # If we are doing online rollouts asynchronously, deepcopy the policy to use for online rollouts (this
     # makes it possible to do online rollouts in parallel with training updates).
@@ -630,7 +699,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             online_rollout_policy.eval()
             start_rollout_time = time.perf_counter()
             with torch.no_grad():
-                eval_info = eval_policy(robot)
+                eval_info = eval_policy(robot, online_rollout_policy, cfg.eval.n_action_buffer)
                 # eval_info = eval_policy(
                 #     online_env,
                 #     online_rollout_policy,

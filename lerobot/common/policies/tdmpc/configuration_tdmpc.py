@@ -120,9 +120,7 @@ class TDMPCConfig:
 
     # Normalization / Unnormalization
     input_normalization_modes: dict[str, str] | None = None
-    output_normalization_modes: dict[str, str] = field(
-        default_factory=lambda: {"action": "min_max"},
-    )
+    output_normalization_modes: dict[str, str] | None = None
 
     # Architecture / modeling.
     # Neural networks.
@@ -180,12 +178,12 @@ class TDMPCConfig:
             raise ValueError(
                 f"The number of guassian samples for CEM should be non-zero. Got `{self.n_gaussian_samples=}`"
             )
-        if self.output_normalization_modes != {"action": "min_max"}:
-            raise ValueError(
-                "TD-MPC assumes the action space dimensions to all be in [-1, 1]. Therefore it is strongly "
-                f"advised that you stick with the default. See {self.__class__.__name__} docstring for more "
-                "information."
-            )
+        # if self.output_normalization_modes != {"action": "min_max"}:
+        #     raise ValueError(
+        #         "TD-MPC assumes the action space dimensions to all be in [-1, 1]. Therefore it is strongly "
+        #         f"advised that you stick with the default. See {self.__class__.__name__} docstring for more "
+        #         "information."
+        #     )
         if self.n_action_steps > 1:
             if self.n_action_repeats != 1:
                 raise ValueError(

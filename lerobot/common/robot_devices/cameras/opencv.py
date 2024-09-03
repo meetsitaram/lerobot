@@ -326,6 +326,8 @@ class OpenCVCamera:
         # log the utc time at which the image was received
         self.logs["timestamp_utc"] = capture_timestamp_utc()
 
+        color_image = cv2.resize(color_image, (88, 66))
+
         return color_image
 
     def read_loop(self):

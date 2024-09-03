@@ -3,6 +3,7 @@ import logging
 
 import numpy as np
 import open3d as o3d
+from scipy.spatial.transform import Rotation
 
 GREEN = np.array([0.5, 1.0, 0.5])
 RED = np.array([1.0, 0.1, 0.1])
@@ -43,7 +44,195 @@ def screw_axis_to_transform(S, theta):
     return T
 
 
+def pose_difference_se3(pose1, pose2):
+    """
+    TODO: verify as this is from chatgpt
+    Calculates the SE(3) difference between two 4x4 homogeneous transformation matrices.
+
+    pose1 - pose2
+
+    Args:
+        pose1: A 4x4 numpy array representing the first pose.
+        pose2: A 4x4 numpy array representing the second pose.
+
+    Returns:
+        A tuple (translation_diff, rotation_diff) where:
+        - translation_diff is a 3x1 numpy array representing the translational difference.
+        - rotation_diff is a 3x1 numpy array representing the rotational difference in axis-angle representation.
+    """
+
+    # Extract rotation matrices from poses
+    R1 = pose1[:3, :3]
+    R2 = pose2[:3, :3]
+
+    # Calculate translational difference
+    translation_diff = pose1[:3, 3] - pose2[:3, 3]
+
+    # Calculate rotational difference using scipy's Rotation library
+    R_diff = Rotation.from_matrix(R1 @ R2.T)
+    rotation_diff = R_diff.as_rotvec()  # Convert to axis-angle representation
+
+    return np.concatenate([translation_diff, rotation_diff])
+
+
 class DigitalTwin:
+    gripper_X0 = np.array(
+        [
+            [1, 0, 0, 0],
+            [0, 0, 1, 0],
+            [0, -1, 0, 0],
+            [0, 0, 0, 1],
+        ]
+    )
+    # Screw axis of gripper frame wrt base frame.
+    S_BG = np.array([1, 0, 0, 0, 0.018, 0])
+    # Gripper origin to centroid transform.
+    X_GoGc = np.array(
+        [
+            [1, 0, 0, 0.035],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]
+    )
+    # Gripper origin to tip transform.
+    X_GoGt = np.array(
+        [
+            [1, 0, 0, 0.07],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]
+    )
+    # 0-position humerus frame pose wrt base.
+    X_BoGo = np.array(
+        [
+            [1, 0, 0, 0.253],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0.018],
+            [0, 0, 0, 1],
+        ]
+    )
+
+    # Wrist
+    wrist_X0 = np.array(
+        [
+            [0, -1, 0, 0],
+            [1, 0, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]
+    )
+
+    # Screw axis of wrist frame wrt base frame.
+    S_BR = np.array([0, 1, 0, -0.018, 0, +0.21])
+    # 0-position origin to centroid transform.
+    X_RoRc = np.array(
+        [
+            [1, 0, 0, 0.0035],
+            [0, 1, 0, -0.002],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]
+    )
+    # 0-position wrist frame pose wrt base.
+    X_BR = np.array(
+        [
+            [1, 0, 0, 0.210],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0.018],
+            [0, 0, 0, 1],
+        ]
+    )
+
+    # Screw axis of forearm frame wrt base frame.
+    S_BF = np.array([0, 1, 0, -0.020, 0, +0.109])
+    # Forearm origin + centroid transform.
+    X_FoFc = np.array(
+        [
+            [1, 0, 0, 0.036],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]
+    )
+    # 0-position forearm frame pose wrt base.
+    X_BF = np.array(
+        [
+            [1, 0, 0, 0.109],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0.020],
+            [0, 0, 0, 1],
+        ]
+    )
+
+    # Screw axis of humerus frame wrt base frame.
+    S_BH = np.array([0, -1, 0, 0.036, 0, 0])
+    # Humerus origin to centroid transform.
+    X_HoHc = np.array(
+        [
+            [1, 0, 0, 0.0475],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]
+    )
+    # 0-position humerus frame pose wrt base.
+    X_BH = np.array(
+        [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0.036],
+            [0, 0, 0, 1],
+        ]
+    )
+
+    # Screw axis of shoulder frame wrt Base frame.
+    S_BS = np.array([0, 0, -1, 0, 0, 0])
+    X_SoSc = np.array(
+        [
+            [1, 0, 0, -0.017],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0.0035],
+            [0, 0, 0, 1],
+        ]
+    )
+    X_BS = np.array(
+        [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0.02],
+            [0, 0, 0, 1],
+        ]
+    )
+
+    # o3d seems to be aligning the box frame so that it is longest to longest to shortest on xyz.
+    base_X0 = np.array(
+        [
+            [0, 0, 1, 0],
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 0, 1],
+        ]
+    )
+
+    X_BoBc = np.array(
+        [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0.015],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]
+    )
+    X_WoBo = np.array(
+        [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0.02],
+            [0, 0, 0, 1],
+        ]
+    )
+
     def __init__(self):
         # Frames. All origins of robot link frames are at the center of the respective motor axis.
         # (W)orld
@@ -55,14 +244,6 @@ class DigitalTwin:
         # (G)ripper  # Go is at the point where the wrist twist motor connects to the gripper
 
         # Gripper
-        self.gripper_X0 = np.array(
-            [
-                [1, 0, 0, 0],
-                [0, 0, 1, 0],
-                [0, -1, 0, 0],
-                [0, 0, 0, 1],
-            ]
-        )
         self.gripper = o3d.geometry.OrientedBoundingBox(
             center=[0, 0, 0],
             R=np.eye(3),
@@ -71,36 +252,7 @@ class DigitalTwin:
         # self.gripper.compute_vertex_normals()
         # self.gripper.paint_uniform_color(GREEN)
         self.gripper.color = GREEN
-        # Screw axis of gripper frame wrt base frame.
-        self.S_BG = np.array([1, 0, 0, 0, 0.018, 0])
-        # Gripper origin to centroid transform.
-        self.X_GoGc = np.array(
-            [
-                [1, 0, 0, 0.035],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        # 0-position humerus frame pose wrt base.
-        self.X_BoGo = np.array(
-            [
-                [1, 0, 0, 0.253],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0.018],
-                [0, 0, 0, 1],
-            ]
-        )
 
-        # Wrist
-        self.wrist_X0 = np.array(
-            [
-                [0, -1, 0, 0],
-                [1, 0, 0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
-        )
         self.wrist = o3d.geometry.TriangleMesh.create_from_oriented_bounding_box(
             o3d.geometry.OrientedBoundingBox(
                 center=[0, 0, 0],
@@ -110,26 +262,6 @@ class DigitalTwin:
         )
         self.wrist.compute_vertex_normals()
         self.wrist.paint_uniform_color(GREEN)
-        # Screw axis of wrist frame wrt base frame.
-        self.S_BR = np.array([0, 1, 0, -0.018, 0, +0.21])
-        # 0-position origin to centroid transform.
-        self.X_RoRc = np.array(
-            [
-                [1, 0, 0, 0.0035],
-                [0, 1, 0, -0.002],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        # 0-position wrist frame pose wrt base.
-        self.X_BR = np.array(
-            [
-                [1, 0, 0, 0.210],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0.018],
-                [0, 0, 0, 1],
-            ]
-        )
 
         # Forearm
         self.forearm = o3d.geometry.TriangleMesh.create_from_oriented_bounding_box(
@@ -141,26 +273,6 @@ class DigitalTwin:
         )
         self.forearm.compute_vertex_normals()
         self.forearm.paint_uniform_color(GREEN)
-        # Screw axis of forearm frame wrt base frame.
-        self.S_BF = np.array([0, 1, 0, -0.020, 0, +0.109])
-        # Forearm origin + centroid transform.
-        self.X_FoFc = np.array(
-            [
-                [1, 0, 0, 0.036],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        # 0-position forearm frame pose wrt base.
-        self.X_BF = np.array(
-            [
-                [1, 0, 0, 0.109],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0.020],
-                [0, 0, 0, 1],
-            ]
-        )
 
         # Humerus
         self.humerus = o3d.geometry.TriangleMesh.create_from_oriented_bounding_box(
@@ -172,28 +284,8 @@ class DigitalTwin:
         )
         self.humerus.compute_vertex_normals()
         self.humerus.paint_uniform_color(GREEN)
-        # Screw axis of humerus frame wrt base frame.
-        self.S_BH = np.array([0, -1, 0, 0.036, 0, 0])
-        # Humerus origin to centroid transform.
-        self.X_HoHc = np.array(
-            [
-                [1, 0, 0, 0.0475],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        # 0-position humerus frame pose wrt base.
-        self.X_BH = np.array(
-            [
-                [1, 0, 0, 0],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0.036],
-                [0, 0, 0, 1],
-            ]
-        )
 
-        # Screw axis of shoulder frame wrt Base frame.
+        # Shoulder
         self.shoulder = o3d.geometry.TriangleMesh.create_from_oriented_bounding_box(
             o3d.geometry.OrientedBoundingBox(
                 center=[0, 0, 0],
@@ -203,34 +295,8 @@ class DigitalTwin:
         )
         self.shoulder.compute_vertex_normals()
         self.shoulder.paint_uniform_color(GREEN)
-        self.S_BS = np.array([0, 0, -1, 0, 0, 0])
-        self.X_SoSc = np.array(
-            [
-                [1, 0, 0, -0.017],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0.0035],
-                [0, 0, 0, 1],
-            ]
-        )
-        self.X_BS = np.array(
-            [
-                [1, 0, 0, 0],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0.02],
-                [0, 0, 0, 1],
-            ]
-        )
 
         # Base to world transform.
-        # o3d seems to be aligning the box frame so that it is longest to longest to shortest on xyz.
-        self.base_X0 = np.array(
-            [
-                [0, 0, 1, 0],
-                [1, 0, 0, 0],
-                [0, 1, 0, 0],
-                [0, 0, 0, 1],
-            ]
-        )
         self.base = o3d.geometry.TriangleMesh.create_from_oriented_bounding_box(
             o3d.geometry.OrientedBoundingBox(
                 center=[0, 0, 0],
@@ -240,22 +306,6 @@ class DigitalTwin:
         )
         self.base.compute_vertex_normals()
         self.base.paint_uniform_color(GREEN)
-        self.X_BoBc = np.array(
-            [
-                [1, 0, 0, 0],
-                [0, 1, 0, 0.015],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ]
-        )
-        self.X_WoBo = np.array(
-            [
-                [1, 0, 0, 0],
-                [0, 1, 0, 0],
-                [0, 0, 1, 0.02],
-                [0, 0, 0, 1],
-            ]
-        )
 
         coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=[0, 0, 0])
 
@@ -382,6 +432,43 @@ class DigitalTwin:
             @ self.gripper_X0
         )
 
+    def jac_gripper(self, robot_pos_deg):
+        """Finite differences to compute the Jacobian.
+        J(i, j) represents how the ith component of the end-effector's velocity changes wrt a small change
+        in the jth joint's velocity.
+
+        TODO: This is probably wrong lol
+        """
+        eps = 1e-8
+        jac = []
+        for el_ix in range(len(robot_pos_deg)):
+            delta = np.zeros(len(robot_pos_deg), dtype=np.float64)
+            delta[el_ix] = eps / 2
+            Sdot = (
+                pose_difference_se3(
+                    self.fk_gripper(robot_pos_deg + delta), self.fk_gripper(robot_pos_deg - delta)
+                )
+                / eps
+            )
+            jac.append(Sdot)
+        jac = np.column_stack(jac)
+        return jac
+
+    @staticmethod
+    def fk_gripper_tip(robot_pos_deg):
+        robot_pos_rad = robot_pos_deg / 180 * np.pi
+        return (
+            DigitalTwin.X_WoBo
+            @ screw_axis_to_transform(DigitalTwin.S_BS, robot_pos_rad[0])
+            @ screw_axis_to_transform(DigitalTwin.S_BH, robot_pos_rad[1])
+            @ screw_axis_to_transform(DigitalTwin.S_BF, robot_pos_rad[2])
+            @ screw_axis_to_transform(DigitalTwin.S_BR, robot_pos_rad[3])
+            @ screw_axis_to_transform(DigitalTwin.S_BG, robot_pos_rad[4])
+            @ DigitalTwin.X_GoGt
+            @ DigitalTwin.X_BoGo
+            @ DigitalTwin.gripper_X0
+        )
+
     def set_object_pose(self, obj, X_WO):
         if obj is self.gripper:
             self.gripper.center = X_WO[:3, 3]
@@ -432,5 +519,8 @@ class DigitalTwin:
             waypoint.translate(pos, relative=False)
             self.vis.update_geometry(waypoint)
 
-    def __del__(self):
+    def close(self):
         self.vis.destroy_window()
+
+    def __del__(self):
+        self.close()
