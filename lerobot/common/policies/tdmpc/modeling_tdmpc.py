@@ -105,7 +105,7 @@ class TDMPCPolicy(
             self.unnormalize_outputs = nn.Identity()
 
         self.expected_image_key = None
-        expected_image_keys = [k for k in config.input_shapes if k.startswith(self.expected_image_key)]
+        expected_image_keys = [k for k in config.input_shapes if k.startswith("observation.image")]
         if len(expected_image_keys) > 0:
             assert len(expected_image_keys) == 1
             self.expected_image_key = expected_image_keys[0]
@@ -385,7 +385,7 @@ class TDMPCPolicy(
         observations = {k: v for k, v in batch.items() if k.startswith("observation.")}
 
         # Apply random image augmentations.
-        if self._use_image and self.config.max_random_shift_ratio > 0:
+        if self.expected_image_key is not None and self.config.max_random_shift_ratio > 0:
             observations[self.expected_image_key] = flatten_forward_unflatten(
                 partial(random_shifts_aug, max_random_shift_ratio=self.config.max_random_shift_ratio),
                 observations[self.expected_image_key],
@@ -750,7 +750,7 @@ class TDMPCObservationEncoder(nn.Module):
         super().__init__()
         self.config = config
 
-        expected_image_keys = [k for k in config.input_shapes if k.startswith(self.expected_image_key)]
+        expected_image_keys = [k for k in config.input_shapes if k.startswith("observation.image")]
         self.expected_image_key = None if len(expected_image_keys) == 0 else expected_image_keys[0]
 
         if self.expected_image_key is not None:

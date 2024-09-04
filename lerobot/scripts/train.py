@@ -41,13 +41,16 @@ from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.utils import cycle
 from lerobot.common.datasets.video_utils import load_from_videos
 from lerobot.common.envs.factory import make_env
+from lerobot.common.kinematics import KochKinematics
 from lerobot.common.logger import Logger, log_output_dir
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.policies.policy_protocol import PolicyWithUpdate
 from lerobot.common.policies.utils import get_device_from_parameters
+from lerobot.common.rl import is_in_bounds
 from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.koch import KochRobot
+from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.utils import (
     format_big_number,
     get_safe_torch_device,
@@ -57,7 +60,7 @@ from lerobot.common.utils.utils import (
 )
 from lerobot.scripts.eval_real import rollout
 
-CLIP = np.array([5, 8, 6, 6, 6, 2])
+CLIP = np.array([5, 8, 6, 8, 6, 5])
 FPS = 20.0
 
 
@@ -264,42 +267,57 @@ def say(text, blocking=False):
     os.system(cmd)
 
 
-eval_clip = CLIP.max()
-eval_max_steps = 25
-
-
 def eval_policy(robot: KochRobot, policy, n_action_buffer):
-    global eval_clip
-    global eval_max_steps
-    say("Help me please")
-    while True:
-        try:  # noqa: SIM105
-            res = input("clip size\n")
-            if len(res) > 0:
-                eval_clip = float(res)
-        except ValueError:
-            pass
-        break
-    while True:
-        try:  # noqa: SIM105
-            res = input("max steps\n")
-            if len(res) > 0:
-                eval_max_steps = int(res)
-        except ValueError:
-            pass
-        break
+    # global eval_clip
+    # global eval_max_steps
+    # say("Help me please")
+    # while True:
+    #     try:  # noqa: SIM105
+    #         res = input("clip size\n")
+    #         if len(res) > 0:
+    #             eval_clip = float(res)
+    #     except ValueError:
+    #         pass
+    #     break
+    # while True:
+    #     try:  # noqa: SIM105
+    #         res = input("max steps\n")
+    #         if len(res) > 0:
+    #             eval_max_steps = int(res)
+    #     except ValueError:
+    #         pass
+    #     break
     robot.follower_arms["main"].write("Torque_Enable", TorqueMode.ENABLED.value)
+    reset_pos = robot.follower_arms["main"].read("Present_Position")
+    while True:
+        # goal = [87, 82, 91, 65, 3, 30]
+        reset_pos[0] = np.random.uniform(70, 110)
+        reset_pos[1] = np.random.uniform(70, 90)
+        reset_pos[2] = np.random.uniform(80, 110)
+        reset_pos[3] = np.random.uniform(45, 90)
+        reset_pos[4] = np.random.uniform(-50, 50)
+        reset_pos[5] = np.random.uniform(0, 90)
+        if is_in_bounds(KochKinematics.fk_gripper_tip(reset_pos)[:3, -1], buffer=0.02):
+            break
+        logging.warning("Is OOB")
+    reset_pos = torch.from_numpy(reset_pos)
+    while True:
+        robot.send_action(reset_pos)
+        current_pos = robot.follower_arms["main"].read("Present_Position")
+        busy_wait(1 / FPS)
+        if np.all(np.abs(current_pos - reset_pos.numpy())[-3:] < np.array([10, 3, 3])):
+            break
     eval_info = rollout(
         robot,
         policy,
         FPS,
-        visualize=True,
+        visualize=False,
         warmup_s=1,
-        relative_actions_max=eval_clip,
-        max_steps=eval_max_steps,
+        use_relative_actions=True,
+        max_steps=150,
         n_action_buffer=n_action_buffer,
     )
-    robot.follower_arms["main"].write("Torque_Enable", TorqueMode.DISABLED.value)
+    # robot.follower_arms["main"].write("Torque_Enable", TorqueMode.DISABLED.value)
     return eval_info
 
 
@@ -632,13 +650,13 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         fps=FPS,  # online_env.unwrapped.metadata["render_fps"],
         delta_timestamps=cfg.training.delta_timestamps,
     )
-    # TODO(now): Hack
-    for k in online_dataset._data:
-        if k == OnlineBuffer.NEXT_INDEX_KEY:
-            online_dataset._data[k] = len(offline_dataset_cache)
-        else:
-            fill = offline_dataset_cache._data[k]
-            online_dataset._data[k][: len(fill)] = offline_dataset_cache._data[k]
+    # # TODO(now): Hack
+    # for k in online_dataset._data:
+    #     if k == OnlineBuffer.NEXT_INDEX_KEY:
+    #         online_dataset._data[k] = len(offline_dataset_cache)
+    #     else:
+    #         fill = offline_dataset_cache._data[k]
+    #         online_dataset._data[k][: len(fill)] = offline_dataset_cache._data[k]
 
     # If we are doing online rollouts asynchronously, deepcopy the policy to use for online rollouts (this
     # makes it possible to do online rollouts in parallel with training updates).
@@ -693,7 +711,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             logging.info("Start online training by interacting with environment")
 
         def sample_trajectory_and_update_buffer():
-            nonlocal rollout_start_seed
+            nonlocal rollout_start_seed, step
             with lock:
                 online_rollout_policy.load_state_dict(policy.state_dict())
             online_rollout_policy.eval()
@@ -711,6 +729,8 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                 #         rollout_start_seed := (rollout_start_seed + cfg.training.batch_size) % 1000000
                 #     ),
                 # )
+                if len(online_dataset) > 0:
+                    log_eval_info(logger, eval_info["aggregated"], step, cfg, online_dataset, is_online=True)  # noqa: B023
             online_rollout_s = time.perf_counter() - start_rollout_time
 
             with lock:

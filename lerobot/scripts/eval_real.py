@@ -3,32 +3,27 @@ import logging
 import time
 from collections import defaultdict
 from contextlib import nullcontext
+from pprint import pprint
 
 import cv2
 import numpy as np
 import torch
 from termcolor import colored
 from torch import nn
+from tqdm import trange
 
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.policies.policy_protocol import Policy
 from lerobot.common.policies.rollout_wrapper import PolicyRolloutWrapper
 from lerobot.common.policies.utils import get_device_from_parameters
+from lerobot.common.rl import calc_reward_joint_goal, reset_for_joint_pos
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.koch import KochRobot
+from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.digital_twin import DigitalTwin
 from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
 from lerobot.common.vision import GoalSetter, HSVSegmenter
 from lerobot.scripts.eval import get_pretrained_policy_path
-
-
-def busy_wait(seconds: float):
-    # Significantly more accurate than `time.sleep`, and mandatory for our use case,
-    # but it consumes CPU cycles.
-    # TODO(rcadene): find an alternative: from python 11, time.sleep is precise
-    end_time = time.perf_counter() + seconds
-    while time.perf_counter() < end_time:
-        time.sleep(0.0001)
 
 
 def rollout(
@@ -37,16 +32,17 @@ def rollout(
     fps: float,
     n_action_buffer: int = 0,
     warmup_s: float = 5.0,
-    relative_actions_max: float | None = None,
+    use_relative_actions: bool = False,
     max_steps: int | None = None,
     visualize: bool = False,
-):
-    segmenter = HSVSegmenter()
+) -> dict:
+    segmenter = HSVSegmenter()  # noqa: F841
     goal_setter = GoalSetter.from_mask_file("outputs/goal_mask.npy")
     goal_mask = goal_setter.get_goal_mask()
     where_goal = np.where(goal_mask > 0)
 
-    digital_twin = DigitalTwin()
+    if visualize:
+        digital_twin = DigitalTwin()
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
     device = get_device_from_parameters(policy)
     policy_rollout_wrapper = PolicyRolloutWrapper(policy, fps=fps, n_action_buffer=n_action_buffer)
@@ -59,7 +55,7 @@ def rollout(
     def to_relative_time(t):
         return t - start_time
 
-    episodes_data = defaultdict(list)
+    episode_data = defaultdict(list)
 
     period = 1 / fps
     to_visualize = {}
@@ -74,41 +70,38 @@ def rollout(
         observation: dict[str, torch.Tensor] = robot.capture_observation()
         annotated_img = None
         if not is_warmup:
-            episodes_data["index"].append(step)
-            episodes_data["episode_index"].append(0)
-            episodes_data["timestamp"].append(start_step_time)
-            episodes_data["frame_index"].append(step)
+            episode_data["index"].append(step)
+            episode_data["episode_index"].append(0)
+            episode_data["timestamp"].append(start_step_time)
+            episode_data["frame_index"].append(step)
             for k in observation:
                 if k.startswith("observation.image"):
-                    episodes_data[k].append(observation[k].permute(2, 0, 1).numpy().astype(float) / 255.0)
+                    episode_data[k].append(observation[k].permute(2, 0, 1).numpy().astype(float) / 255.0)
                     # img = observation[k].numpy()
                     # if step > 0:
                     #     try:
                     #         obj_mask, annotated_img = segmenter.segment(img)
-                    #         reward, success = calc_reward(
+                    #         reward, success = calc_reward_cube_push(
                     #             obj_mask,
                     #             goal_mask,
-                    #             episodes_data["action"][-1],
-                    #             digital_twin.fk_gripper_tip(observation["observation.state"].numpy())[:3, 3]
+                    #             episode_data["action"][-1],
+                    #             KochKinematics.fk_gripper_tip(observation["observation.state"].numpy())[:3, 3]
                     #         )
                     #     except:
                     #         logging.warning(colored("Failed to compute reward", "yellow"))
                     #         reward = -2
                     #         success = False
                 else:
-                    episodes_data[k].append(observation[k].numpy())
+                    episode_data[k].append(observation[k].numpy())
 
             if step > 0:
-                goal = np.array([87, 82, 91, 65, 3, 0])
-                curr = observation["observation.state"].numpy()
-                reward = -np.abs(goal - curr).mean() / 10
-                success = np.abs(goal - curr).max() <= 3
-                if digital_twin.fk_gripper_tip(observation["observation.state"].numpy())[2, -1] < 0.004:
-                    reward -= 1
+                reward, success, do_terminate = calc_reward_joint_goal(
+                    observation["observation.state"].numpy()
+                )
                 print("REWARD:", reward, ", SUCCESS:", success)
-                episodes_data["next.reward"].append(reward)
-                episodes_data["next.success"].append(success)
-                episodes_data["next.done"].append(success)
+                episode_data["next.reward"].append(reward)
+                episode_data["next.success"].append(success)
+                episode_data["next.done"].append(success or do_terminate)
 
         follower_pos = observation["observation.state"].numpy()
         if first_follower_pos is None:
@@ -163,7 +156,7 @@ def rollout(
             if action_sequence is not None:
                 action_sequence = action_sequence.squeeze(1)  # remove batch dim
 
-        if action_sequence is not None:
+        if action_sequence is not None and visualize:
             digital_twin.set_twin_pose(follower_pos, follower_pos + action_sequence.numpy())
 
         if step == 0:
@@ -211,13 +204,18 @@ def rollout(
             robot.send_action(torch.from_numpy(first_follower_pos))
             logging.info("Warming up.")
         else:
-            if relative_actions_max is not None:
+            if use_relative_actions:
                 relative_action = action
-                # Policy provided relative actions.
-                relative_action = torch.clamp(relative_action, -relative_actions_max, relative_actions_max)
                 action = torch.from_numpy(follower_pos) + relative_action
+
+            # The robot may itself clamp the action, and return the appropriate action.
             action = robot.send_action(action)
-            episodes_data["action"].append(relative_action.numpy())
+
+            if use_relative_actions:
+                relative_action = action - torch.from_numpy(follower_pos)
+                episode_data["action"].append(relative_action.numpy())
+            else:
+                episode_data["action"].append(action.numpy())
 
         elapsed = to_relative_time(time.perf_counter()) - start_step_time
         if elapsed > period:
@@ -225,40 +223,92 @@ def rollout(
         else:
             busy_wait(period - elapsed - 0.001)
 
-        if digital_twin.quit_signal_is_set():
+        if visualize and digital_twin.quit_signal_is_set():
             break
 
         if not is_warmup:
             step += 1
 
-        if step >= max_steps:
-            episodes_data["next.done"][-1] = True
+        if max_steps is not None and step >= max_steps:
+            episode_data["next.done"][-1] = True
 
-        if len(episodes_data["next.done"]) > 0 and episodes_data["next.done"][-1]:
+        if len(episode_data["next.done"]) > 0 and episode_data["next.done"][-1]:
             break
 
-    for k in episodes_data:
+    for k in episode_data:
         if k.startswith("next."):
-            episodes_data[k].append(episodes_data[k][-1])
+            episode_data[k].append(episode_data[k][-1])
 
-    for k in episodes_data:
-        episodes_data[k] = np.stack(episodes_data[k])
+    for k in episode_data:
+        episode_data[k] = np.stack(episode_data[k])
 
-    episodes_data["next.done"][-1] = True
+    episode_data["next.done"][-1] = True
 
     # Hack: drop the first frame because of first inference being slow.
-    for k in episodes_data:
-        episodes_data[k] = episodes_data[k][1:]
-    episodes_data["frame_index"] -= 1
-    episodes_data["index"] -= 1
+    for k in episode_data:
+        episode_data[k] = episode_data[k][1:]
+    episode_data["frame_index"] -= 1
+    episode_data["index"] -= 1
 
     policy_rollout_wrapper.close_thread()
 
-    digital_twin.close()
+    if visualize:
+        digital_twin.close()
 
     return {
-        "episodes": episodes_data,
+        "sum_reward": sum(episode_data["next.reward"]),
+        "max_reward": max(episode_data["next.reward"]),
+        "success": episode_data["next.success"][-1],
     }
+
+
+def eval_policy(
+    robot,
+    policy: torch.nn.Module,
+    n_episodes: int,
+    n_action_buffer: int = 0,
+    warmup_time_s: int = 0,
+    use_relative_actions: bool = False,
+    max_steps: int | None = None,
+    visualize: bool = False,
+    enable_progbar: bool = False,
+) -> dict:
+    assert isinstance(policy, nn.Module)
+    policy.eval()
+
+    start_eval = time.perf_counter()
+    progbar = trange(n_episodes, disable=not enable_progbar)
+    for _ in progbar:
+        reset_for_joint_pos(robot)
+
+        all_results = []
+        with (
+            torch.no_grad(),
+            torch.autocast(device_type=device.type) if hydra_cfg.use_amp else nullcontext(),
+        ):
+            results = rollout(
+                robot,
+                policy,
+                args.fps,
+                n_action_buffer=n_action_buffer,
+                warmup_s=warmup_time_s,
+                use_relative_actions=use_relative_actions,
+                max_steps=max_steps,
+                visualize=visualize,
+            )
+            all_results.append(results)
+
+    eval_info = {
+        "episodes": all_results,
+        "aggregated": {
+            "avg_sum_reward": float(sum(r["sum_reward"] for r in all_results) / len(all_results)),
+            "avg_max_reward": float(sum(r["max_reward"] for r in all_results) / len(all_results)),
+            "pc_success": float(sum([r["success"] for r in all_results]) / len(all_results) * 100),
+            "eval_s": time.perf_counter() - start_eval,
+            "eval_ep_s": (time.perf_counter() - start_eval) / len(all_results),
+        },
+    }
+    return eval_info
 
 
 if __name__ == "__main__":
@@ -275,7 +325,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--warmup-time-s",
         type=int,
-        default=5,
+        default=1,
         help="Number of seconds before starting data collection. It allows the robot devices to warmup and synchronize.",
     )
     parser.add_argument(
@@ -287,14 +337,16 @@ if __name__ == "__main__":
             "saved using `Policy.save_pretrained`."
         ),
     )
+    parser.add_argument("-n", "--n-episodes", type=int, default=1)
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--use-relative-actions", action="store_true")
+    parser.add_argument("-v", "--visualize", action="store_true")
     parser.add_argument(
         "--policy-overrides",
         type=str,
         nargs="*",
         help="Any key=value arguments to override config values (use dots for.nested=overrides)",
     )
-    parser.add_argument("-v", "--visualize", action="store_true")
-
     args = parser.parse_args()
 
     init_logging()
@@ -318,18 +370,18 @@ if __name__ == "__main__":
 
         policy = make_policy(hydra_cfg=hydra_cfg, pretrained_policy_name_or_path=str(pretrained_policy_path))
 
-        assert isinstance(policy, nn.Module)
-        policy.eval()
-
-        with torch.no_grad(), torch.autocast(device_type=device.type) if hydra_cfg.use_amp else nullcontext():
-            rollout(
-                robot,
-                policy,
-                args.fps,
-                n_action_buffer=args.n_action_buffer,
-                warmup_s=args.warmup_time_s,
-                visualize=args.visualize,
-            )
+        eval_info = eval_policy(
+            robot,
+            policy,
+            n_episodes=args.n_episodes,
+            n_action_buffer=args.n_action_buffer,
+            warmup_time_s=args.warmup_time_s,
+            use_relative_actions=args.use_relative_actions,
+            max_steps=args.max_steps,
+            visualize=args.visualize,
+            enable_progbar=True,
+        )
+        pprint(eval_info["aggregated"])
 
         logging.info("End of eval")
     finally:

@@ -1,3 +1,6 @@
+import time
+
+
 class RobotDeviceNotConnectedError(Exception):
     """Exception raised when the robot device is not connected."""
 
@@ -17,3 +20,12 @@ class RobotDeviceAlreadyConnectedError(Exception):
     ):
         self.message = message
         super().__init__(self.message)
+
+
+def busy_wait(seconds: float):
+    # Significantly more accurate than `time.sleep`, and mandatory for our use case,
+    # but it consumes CPU cycles.
+    # TODO(rcadene): find an alternative: from python 11, time.sleep is precise
+    end_time = time.perf_counter() + seconds
+    while time.perf_counter() < end_time:
+        time.sleep(0.0001)

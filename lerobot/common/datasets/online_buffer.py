@@ -314,7 +314,7 @@ class OnlineBuffer(torch.utils.data.Dataset):
                     f"One or several timestamps unexpectedly violate the tolerance ({min_} > {self.tolerance_s=}"
                     ") inside the episode range."
                 )
-                return self.__getitem__(self, np.random.choice(len(self)))
+                return self.__getitem__(np.random.choice(len(self)))
 
             # Load frames for this data key.
             if np.any(np.diff(argmin_) != 1):

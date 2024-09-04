@@ -128,7 +128,7 @@ from lerobot.common.datasets.push_dataset_to_hub.utils import concatenate_episod
 from lerobot.common.datasets.utils import calculate_episode_data_index, create_branch
 from lerobot.common.datasets.video_utils import encode_video_frames
 from lerobot.common.policies.factory import make_policy
-from lerobot.common.rl import calc_reward
+from lerobot.common.rl import calc_reward_cube_push
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.utils import Robot
 from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
@@ -472,7 +472,7 @@ def record(
                     for key in image_keys:
                         img = observation[key].numpy()
                         obj_mask, annotated_img = segmenter.segment(img)
-                        reward, success = calc_reward(
+                        reward, success = calc_reward_cube_push(
                             obj_mask, goal_mask, (action["action"] - observation["observation.state"]).numpy()
                         )
                         annotated_img[where_goal] = (

@@ -76,6 +76,8 @@ class PolicyRolloutWrapper:
         NOTE: Ensure that any access to these caches is within a thread-locked context as their state is
         managed in different threads.
         """
+        if hasattr(self.policy, "reset"):
+            self.policy.reset()
         with self._thread_lock:
             # Store a mapping from observation timestamp (the moment the observation was captured) to
             # observation batch.
@@ -161,9 +163,9 @@ class PolicyRolloutWrapper:
     def _get_contiguous_action_sequence_from_cache(self, first_action_timestamp_us: float) -> Tensor | None:
         with self._thread_lock:
             action_cache = deepcopy(self._action_cache)
-        if len(action_cache) == 0:
-            return None
         action_cache_timestamps_us = torch.tensor(sorted(action_cache))
+        if len(action_cache) == 0 or action_cache_timestamps_us.max() < first_action_timestamp_us:
+            return None
         action_timestamps_us = torch.arange(
             first_action_timestamp_us, action_cache_timestamps_us.max() + self.period_us, self.period_us
         )
