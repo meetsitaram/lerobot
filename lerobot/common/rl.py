@@ -24,8 +24,8 @@ def is_in_bounds(gripper_tip_pos, buffer=0):
 def calc_smoothness_reward(
     action: np.ndarray,
     prior_action: np.ndarray | None = None,
-    first_order_coeff: float = 1.0,
-    second_order_coeff: float = 1.0,
+    first_order_coeff: float = -1.0,
+    second_order_coeff: float = -1.0,
 ):
     reward = first_order_coeff * np.linalg.norm(action)
     if prior_action is not None:
@@ -82,8 +82,8 @@ def calc_reward_joint_goal(
     current_joint_pos,
     action: np.ndarray | None = None,
     prior_action: np.ndarray | None = None,
-    first_order_smoothness_coeff: float = 1.0,
-    second_order_smoothness_coeff: float = 1.0,
+    first_order_smoothness_coeff: float = -1.0,
+    second_order_smoothness_coeff: float = -1.0,
 ):
     # Whole arm
     goal = np.array([87, 82, 91, 65, 3, 30])
@@ -103,7 +103,7 @@ def calc_reward_joint_goal(
         reward += 1
 
     if action is not None:
-        reward = calc_smoothness_reward(
+        reward += calc_smoothness_reward(
             action, prior_action, first_order_smoothness_coeff, second_order_smoothness_coeff
         )
 

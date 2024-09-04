@@ -1,8 +1,10 @@
 import argparse
+import json
 import logging
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from datetime import datetime as dt
+from pathlib import Path
 from pprint import pprint
 
 import cv2
@@ -95,8 +97,16 @@ def rollout(
                     episode_data[k].append(observation[k].numpy())
 
             if step > 0:
+                if len(episode_data["action"]) >= 2:
+                    prior_action = episode_data["action"][-2]
+                else:
+                    prior_action = np.zeros_like(episode_data["action"][-1])
                 reward, success, do_terminate = calc_reward_joint_goal(
-                    observation["observation.state"].numpy()
+                    observation["observation.state"].numpy(),
+                    episode_data["action"][-1],
+                    prior_action,
+                    first_order_smoothness_coeff=0,
+                    second_order_smoothness_coeff=-0.01,
                 )
                 print("REWARD:", reward, ", SUCCESS:", success)
                 episode_data["next.reward"].append(reward)
@@ -255,16 +265,13 @@ def rollout(
     if visualize:
         digital_twin.close()
 
-    return {
-        "sum_reward": sum(episode_data["next.reward"]),
-        "max_reward": max(episode_data["next.reward"]),
-        "success": episode_data["next.success"][-1],
-    }
+    return episode_data
 
 
 def eval_policy(
     robot,
     policy: torch.nn.Module,
+    fps: float,
     n_episodes: int,
     n_action_buffer: int = 0,
     warmup_time_s: int = 0,
@@ -277,35 +284,54 @@ def eval_policy(
     policy.eval()
 
     start_eval = time.perf_counter()
+    episodes_data = []
+    sum_rewards = []
+    max_rewards = []
+    successes = []
+
     progbar = trange(n_episodes, disable=not enable_progbar)
-    for _ in progbar:
+
+    for episode_index in progbar:
         reset_for_joint_pos(robot)
 
-        all_results = []
-        with (
-            torch.no_grad(),
-            torch.autocast(device_type=device.type) if hydra_cfg.use_amp else nullcontext(),
-        ):
-            results = rollout(
+        with torch.no_grad():
+            episode_data = rollout(
                 robot,
                 policy,
-                args.fps,
+                fps,
                 n_action_buffer=n_action_buffer,
                 warmup_s=warmup_time_s,
                 use_relative_actions=use_relative_actions,
                 max_steps=max_steps,
                 visualize=visualize,
             )
-            all_results.append(results)
+            # Continue the episode and data indices.
+            episode_data["episode_index"] += episode_index
+            if len(episodes_data) > 0:
+                episode_data["index"] += episodes_data[-1]["index"][-1] + 1
+            episodes_data.append(episode_data)
+            sum_rewards.append(sum(episode_data["next.reward"]))
+            max_rewards.append(max(episode_data["next.reward"]))
+            successes.append(episode_data["next.success"][-1])
 
     eval_info = {
-        "episodes": all_results,
+        "per_episode": [
+            {
+                "sum_reward": sum(episode_data["next.reward"]),
+                "max_reward": max(episode_data["next.reward"]),
+                "success": bool(episode_data["next.success"][-1]),
+            }
+            for episode_data in episodes_data
+        ],
+        "episodes": {
+            k: np.concatenate([episode_data[k] for episode_data in episodes_data]) for k in episodes_data[0]
+        },
         "aggregated": {
-            "avg_sum_reward": float(sum(r["sum_reward"] for r in all_results) / len(all_results)),
-            "avg_max_reward": float(sum(r["max_reward"] for r in all_results) / len(all_results)),
-            "pc_success": float(sum([r["success"] for r in all_results]) / len(all_results) * 100),
+            "avg_sum_reward": float(np.mean(sum_rewards)),
+            "avg_max_reward": float(np.mean(max_rewards)),
+            "pc_success": float(np.mean(successes) * 100),
             "eval_s": time.perf_counter() - start_eval,
-            "eval_ep_s": (time.perf_counter() - start_eval) / len(all_results),
+            "eval_ep_s": (time.perf_counter() - start_eval) / len(episodes_data),
         },
     }
     return eval_info
@@ -327,6 +353,13 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of seconds before starting data collection. It allows the robot devices to warmup and synchronize.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        help=(
+            "Where to save the evaluation outputs. If not provided, outputs are saved in "
+            "outputs/eval/{timestamp}"
+        ),
     )
     parser.add_argument(
         "-p",
@@ -351,6 +384,11 @@ if __name__ == "__main__":
 
     init_logging()
 
+    if args.out_dir is None:
+        out_dir = Path(f"outputs/eval/{dt.now().strftime('%Y-%m-%d/%H-%M-%S')}")
+    else:
+        out_dir = Path(args.out_dir)
+
     pretrained_policy_path = get_pretrained_policy_path(args.pretrained_policy_name_or_path)
 
     robot_cfg = init_hydra_config(args.robot_path)
@@ -373,6 +411,7 @@ if __name__ == "__main__":
         eval_info = eval_policy(
             robot,
             policy,
+            args.fps,
             n_episodes=args.n_episodes,
             n_action_buffer=args.n_action_buffer,
             warmup_time_s=args.warmup_time_s,
@@ -382,6 +421,10 @@ if __name__ == "__main__":
             enable_progbar=True,
         )
         pprint(eval_info["aggregated"])
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        with open(Path(out_dir) / "eval_info.json", "w") as f:
+            json.dump({k: v for k, v in eval_info.items() if k in ["per_episode", "aggregated"]}, f, indent=2)
 
         logging.info("End of eval")
     finally:

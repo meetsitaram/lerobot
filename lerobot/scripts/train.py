@@ -41,16 +41,12 @@ from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.utils import cycle
 from lerobot.common.datasets.video_utils import load_from_videos
 from lerobot.common.envs.factory import make_env
-from lerobot.common.kinematics import KochKinematics
 from lerobot.common.logger import Logger, log_output_dir
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.policies.policy_protocol import PolicyWithUpdate
 from lerobot.common.policies.utils import get_device_from_parameters
-from lerobot.common.rl import is_in_bounds
-from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.koch import KochRobot
-from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.utils import (
     format_big_number,
     get_safe_torch_device,
@@ -58,7 +54,7 @@ from lerobot.common.utils.utils import (
     init_logging,
     set_global_seed,
 )
-from lerobot.scripts.eval_real import rollout
+from lerobot.scripts.eval_real import eval_policy
 
 CLIP = np.array([5, 8, 6, 8, 6, 5])
 FPS = 20.0
@@ -267,60 +263,6 @@ def say(text, blocking=False):
     os.system(cmd)
 
 
-def eval_policy(robot: KochRobot, policy, n_action_buffer):
-    # global eval_clip
-    # global eval_max_steps
-    # say("Help me please")
-    # while True:
-    #     try:  # noqa: SIM105
-    #         res = input("clip size\n")
-    #         if len(res) > 0:
-    #             eval_clip = float(res)
-    #     except ValueError:
-    #         pass
-    #     break
-    # while True:
-    #     try:  # noqa: SIM105
-    #         res = input("max steps\n")
-    #         if len(res) > 0:
-    #             eval_max_steps = int(res)
-    #     except ValueError:
-    #         pass
-    #     break
-    robot.follower_arms["main"].write("Torque_Enable", TorqueMode.ENABLED.value)
-    reset_pos = robot.follower_arms["main"].read("Present_Position")
-    while True:
-        # goal = [87, 82, 91, 65, 3, 30]
-        reset_pos[0] = np.random.uniform(70, 110)
-        reset_pos[1] = np.random.uniform(70, 90)
-        reset_pos[2] = np.random.uniform(80, 110)
-        reset_pos[3] = np.random.uniform(45, 90)
-        reset_pos[4] = np.random.uniform(-50, 50)
-        reset_pos[5] = np.random.uniform(0, 90)
-        if is_in_bounds(KochKinematics.fk_gripper_tip(reset_pos)[:3, -1], buffer=0.02):
-            break
-        logging.warning("Is OOB")
-    reset_pos = torch.from_numpy(reset_pos)
-    while True:
-        robot.send_action(reset_pos)
-        current_pos = robot.follower_arms["main"].read("Present_Position")
-        busy_wait(1 / FPS)
-        if np.all(np.abs(current_pos - reset_pos.numpy())[-3:] < np.array([10, 3, 3])):
-            break
-    eval_info = rollout(
-        robot,
-        policy,
-        FPS,
-        visualize=False,
-        warmup_s=1,
-        use_relative_actions=True,
-        max_steps=150,
-        n_action_buffer=n_action_buffer,
-    )
-    # robot.follower_arms["main"].write("Torque_Enable", TorqueMode.DISABLED.value)
-    return eval_info
-
-
 def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
     if out_dir is None:
         raise NotImplementedError()
@@ -415,8 +357,10 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     logging.info("make_policy")
     policy = make_policy(
         hydra_cfg=cfg,
-        dataset_stats=offline_dataset.stats if not cfg.resume else None,
-        pretrained_policy_name_or_path=str(logger.last_pretrained_model_dir) if cfg.resume else None,
+        dataset_stats=offline_dataset.stats if not (cfg.resume or cfg.policy.pretrained_model_path) else None,
+        pretrained_policy_name_or_path=str(logger.last_pretrained_model_dir)
+        if cfg.resume
+        else cfg.policy.pretrained_model_path,
     )
     assert isinstance(policy, nn.Module)
     # Create optimizer and scheduler
@@ -717,7 +661,17 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             online_rollout_policy.eval()
             start_rollout_time = time.perf_counter()
             with torch.no_grad():
-                eval_info = eval_policy(robot, online_rollout_policy, cfg.eval.n_action_buffer)
+                eval_info = eval_policy(
+                    robot,
+                    policy,
+                    FPS,
+                    n_episodes=cfg.training.online_rollout_n_episodes,
+                    n_action_buffer=2,
+                    warmup_time_s=1,
+                    use_relative_actions=True,
+                    max_steps=150,
+                    visualize=False,
+                )
                 # eval_info = eval_policy(
                 #     online_env,
                 #     online_rollout_policy,
