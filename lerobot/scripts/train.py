@@ -670,7 +670,8 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                     warmup_time_s=1,
                     use_relative_actions=True,
                     max_steps=150,
-                    visualize=False,
+                    visualize_img=True,
+                    visualize_3d=False,
                 )
                 # eval_info = eval_policy(
                 #     online_env,

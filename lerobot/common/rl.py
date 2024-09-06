@@ -6,17 +6,20 @@ from lerobot.common.kinematics import KochKinematics
 from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
 from lerobot.common.robot_devices.robots.koch import KochRobot
 from lerobot.common.robot_devices.utils import busy_wait
+from lerobot.common.vision import segment_hsv
 
-GRIPPER_TIP_Z_BOUNDS = (0.004, 0.1)
+GRIPPER_TIP_Z_BOUNDS = (0.004, 0.05)
 GRIPPER_TIP_X_BOUNDS = (-0.15, 0.15)
 GRIPPER_TIP_Y_BOUNDS = (-0.25, -0.05)
-GRIPPER_TIP_BOUNDS = [GRIPPER_TIP_X_BOUNDS, GRIPPER_TIP_Y_BOUNDS, GRIPPER_TIP_Z_BOUNDS]
+GRIPPER_TIP_BOUNDS = np.row_stack([GRIPPER_TIP_X_BOUNDS, GRIPPER_TIP_Y_BOUNDS, GRIPPER_TIP_Z_BOUNDS])
 
 
-def is_in_bounds(gripper_tip_pos, buffer=0):
+def is_in_bounds(gripper_tip_pos, buffer: float | np.ndarray = 0):
+    if not isinstance(buffer, np.ndarray):
+        buffer = np.zeros_like(GRIPPER_TIP_BOUNDS) + buffer
     for i, bounds in enumerate(GRIPPER_TIP_BOUNDS):
-        assert (bounds[1] - bounds[0]) / 2 > buffer
-        if gripper_tip_pos[i] < bounds[0] + buffer or gripper_tip_pos[i] > bounds[1] - buffer:
+        assert (bounds[1] - bounds[0]) > buffer[i].sum()
+        if gripper_tip_pos[i] < bounds[0] + buffer[i][0] or gripper_tip_pos[i] > bounds[1] - buffer[i][1]:
             return False
     return True
 
@@ -34,48 +37,62 @@ def calc_smoothness_reward(
 
 
 def calc_reward_cube_push(
-    obj_mask,
+    img,
     goal_mask,
-    action,
-    gripper_tip_pos,
+    current_joint_pos,
     distance_reward_coeff: float = 1 / 45,
-    action_magnitude_reward_coeff: float = -1 / 25,
-) -> tuple[float, bool]:
-    intersection_area = np.count_nonzero(np.bitwise_and(obj_mask, goal_mask))
+    action: np.ndarray | None = None,
+    prior_action: np.ndarray | None = None,
+    first_order_smoothness_coeff: float = -1.0,
+    second_order_smoothness_coeff: float = -1.0,
+) -> tuple[float, bool, bool, dict]:
+    obj_mask, annotated_img = segment_hsv(img)
 
-    success = False
-    if intersection_area <= 0:
-        # Find the minimum distance between the object and the goal.
-        goal_contour = cv2.findContours(
-            goal_mask.astype(np.uint8), mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_SIMPLE
-        )[0]
-        obj_contour = cv2.findContours(
-            obj_mask.astype(np.uint8), mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_SIMPLE
-        )[0]
-        obj_points = np.vstack(obj_contour).squeeze()  # shape (N, 2)
-        goal_points = np.vstack(goal_contour).squeeze()  # shape (M, 2)
-        distances = np.linalg.norm(obj_points[:, None] - goal_points[None, :], axis=-1)  # shape (N, M, 2)
-        reward = -np.min(distances) * distance_reward_coeff
-    elif intersection_area > 0:
-        reward = intersection_area / np.count_nonzero(obj_mask)
-        success = reward == 1
+    if np.count_nonzero(obj_mask) >= 10:
+        intersection_area = np.count_nonzero(np.bitwise_and(obj_mask, goal_mask))
 
-    reward += action_magnitude_reward_coeff * np.abs(action).max()
+        success = False
+        if intersection_area <= 0:
+            # Find the minimum distance between the object and the goal.
+            goal_contour = cv2.findContours(
+                goal_mask.astype(np.uint8), mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_SIMPLE
+            )[0]
+            obj_contour = cv2.findContours(
+                obj_mask.astype(np.uint8), mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_SIMPLE
+            )[0]
+            obj_points = np.vstack(obj_contour).squeeze()  # shape (N, 2)
+            goal_points = np.vstack(goal_contour).squeeze()  # shape (M, 2)
+            distances = np.linalg.norm(obj_points[:, None] - goal_points[None, :], axis=-1)  # shape (N, M, 2)
+            reward = -np.min(distances) * distance_reward_coeff
+        elif intersection_area > 0:
+            reward = intersection_area / np.count_nonzero(obj_mask)
+            success = reward == 1
+    else:
+        success = False
+        reward = -3
 
     do_terminate = False
 
+    gripper_tip_pos = KochKinematics.fk_gripper_tip(current_joint_pos)[:3, -1]
     if not is_in_bounds(gripper_tip_pos):
         do_terminate = True
-        reward -= 1
+        reward -= 5
 
     if success:
         do_terminate = True
         reward += 1
 
+    if action is not None:
+        reward += calc_smoothness_reward(
+            action, prior_action, first_order_smoothness_coeff, second_order_smoothness_coeff
+        )
+
     # Lose 1 for each step to encourage faster completion.
     reward -= 1
 
-    return reward, success, do_terminate
+    info = {"annotated_img": annotated_img}
+
+    return reward, success, do_terminate, info
 
 
 def calc_reward_joint_goal(
@@ -110,6 +127,15 @@ def calc_reward_joint_goal(
     return reward, success, do_terminate
 
 
+def _go_to_pos(robot, pos):
+    while True:
+        robot.send_action(pos)
+        current_pos = robot.follower_arms["main"].read("Present_Position")
+        busy_wait(1 / 30)
+        if np.all(np.abs(current_pos - pos.numpy()) < np.array([3, 3, 3, 10, 3, 3])):
+            break
+
+
 def reset_for_joint_pos(robot: KochRobot):
     robot.follower_arms["main"].write("Torque_Enable", TorqueMode.ENABLED.value)
     reset_pos = robot.follower_arms["main"].read("Present_Position")
@@ -124,9 +150,44 @@ def reset_for_joint_pos(robot: KochRobot):
         if is_in_bounds(KochKinematics.fk_gripper_tip(reset_pos)[:3, -1], buffer=0.02):
             break
     reset_pos = torch.from_numpy(reset_pos)
+    _go_to_pos(robot, reset_pos)
+
+
+def reset_for_cube_push(robot: KochRobot):
+    robot.follower_arms["main"].write("Torque_Enable", TorqueMode.ENABLED.value)
+    staging_pos = torch.tensor([90, 100, 60, 65, 3, 30]).float()
     while True:
-        robot.send_action(reset_pos)
-        current_pos = robot.follower_arms["main"].read("Present_Position")
-        busy_wait(1 / 30)
-        if np.all(np.abs(current_pos - reset_pos.numpy())[-3:] < np.array([10, 3, 3])):
+        reset_pos = torch.tensor(
+            [
+                np.random.uniform(125, 135),
+                np.random.uniform(60, 64),
+                np.random.uniform(64, 66),
+                np.random.uniform(78, 98),
+                np.random.uniform(-41, -31),
+                np.random.uniform(0, 20),
+            ]
+        ).float()
+        if is_in_bounds(
+            KochKinematics.fk_gripper_tip(reset_pos.numpy())[:3, -1],
+            buffer=np.array([[0.02, 0.02], [0.02, 0.02], [0.02, 0.01]]),
+        ):
             break
+    intermediate_pos = torch.from_numpy(robot.follower_arms["main"].read("Present_Position"))
+    intermediate_pos[1:] = staging_pos[1:]
+    _go_to_pos(robot, intermediate_pos)
+    if staging_pos[0] > intermediate_pos[0]:
+        _go_to_pos(robot, staging_pos)
+    intermediate_pos = staging_pos.clone()
+    intermediate_pos[0] = reset_pos[0]
+    _go_to_pos(robot, intermediate_pos)
+    _go_to_pos(robot, reset_pos)
+
+
+if __name__ == "__main__":
+    from lerobot.common.robot_devices.robots.factory import make_robot
+    from lerobot.common.utils.utils import init_hydra_config
+
+    robot = make_robot(init_hydra_config("lerobot/configs/robot/koch_.yaml"))
+    robot.connect()
+    reset_for_cube_push(robot)
+    robot.disconnect()

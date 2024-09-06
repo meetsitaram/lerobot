@@ -19,13 +19,16 @@ from lerobot.common.policies.policy_protocol import Policy
 from lerobot.common.policies.rollout_wrapper import PolicyRolloutWrapper
 from lerobot.common.policies.tdmpc.modeling_tdmpc import TDMPCPolicy
 from lerobot.common.policies.utils import get_device_from_parameters
-from lerobot.common.rl import calc_reward_joint_goal, reset_for_joint_pos
+from lerobot.common.rl import (
+    calc_reward_cube_push,
+    reset_for_cube_push,
+)
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.koch import KochRobot
 from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.digital_twin import DigitalTwin
 from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
-from lerobot.common.vision import GoalSetter, HSVSegmenter
+from lerobot.common.vision import GoalSetter
 from lerobot.scripts.eval import get_pretrained_policy_path
 
 
@@ -37,14 +40,14 @@ def rollout(
     warmup_s: float = 5.0,
     use_relative_actions: bool = False,
     max_steps: int | None = None,
-    visualize: bool = False,
+    visualize_img: bool = False,
+    visualize_3d: bool = False,
 ) -> dict:
-    segmenter = HSVSegmenter()  # noqa: F841
     goal_setter = GoalSetter.from_mask_file("outputs/goal_mask.npy")
     goal_mask = goal_setter.get_goal_mask()
     where_goal = np.where(goal_mask > 0)
 
-    if visualize:
+    if visualize_3d:
         digital_twin = DigitalTwin()
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
     device = get_device_from_parameters(policy)
@@ -80,20 +83,6 @@ def rollout(
             for k in observation:
                 if k.startswith("observation.image"):
                     episode_data[k].append(observation[k].permute(2, 0, 1).numpy().astype(float) / 255.0)
-                    # img = observation[k].numpy()
-                    # if step > 0:
-                    #     try:
-                    #         obj_mask, annotated_img = segmenter.segment(img)
-                    #         reward, success = calc_reward_cube_push(
-                    #             obj_mask,
-                    #             goal_mask,
-                    #             episode_data["action"][-1],
-                    #             KochKinematics.fk_gripper_tip(observation["observation.state"].numpy())[:3, 3]
-                    #         )
-                    #     except:
-                    #         logging.warning(colored("Failed to compute reward", "yellow"))
-                    #         reward = -2
-                    #         success = False
                 else:
                     episode_data[k].append(observation[k].numpy())
 
@@ -102,13 +91,26 @@ def rollout(
                     prior_action = episode_data["action"][-2]
                 else:
                     prior_action = np.zeros_like(episode_data["action"][-1])
-                reward, success, do_terminate = calc_reward_joint_goal(
-                    observation["observation.state"].numpy(),
-                    episode_data["action"][-1],
-                    prior_action,
+                reward, success, do_terminate, info = calc_reward_cube_push(
+                    img=observation["observation.images.webcam"].numpy(),
+                    goal_mask=goal_mask,
+                    current_joint_pos=observation["observation.state"].numpy(),
+                    action=episode_data["action"][-1],
+                    prior_action=prior_action,
                     first_order_smoothness_coeff=0,
-                    second_order_smoothness_coeff=-0.04,
+                    second_order_smoothness_coeff=-0.02,
                 )
+                annotated_img = info["annotated_img"]
+                annotated_img[where_goal] = (
+                    annotated_img[where_goal] - (annotated_img[where_goal] - np.array([255, 255, 255])) // 2
+                )
+                # reward, success, do_terminate = calc_reward_joint_goal(
+                #     observation["observation.state"].numpy(),
+                #     episode_data["action"][-1],
+                #     prior_action,
+                #     first_order_smoothness_coeff=0,
+                #     second_order_smoothness_coeff=-0.04,
+                # )
                 print("REWARD:", reward, ", SUCCESS:", success)
                 episode_data["next.reward"].append(reward)
                 episode_data["next.success"].append(success)
@@ -126,14 +128,10 @@ def rollout(
         # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
         for name in observation:
             if name.startswith("observation.image"):
-                if visualize:
+                if visualize_img:
                     to_visualize[name] = observation[name].numpy() if annotated_img is None else annotated_img
+                    to_visualize[name] = cv2.resize(to_visualize[name], (640, 480))
                     if start_step_time > warmup_s:
-                        to_visualize[name][where_goal] = (
-                            to_visualize[name][where_goal]
-                            - (to_visualize[name][where_goal] - np.array([255, 255, 255])) // 2
-                        )
-                        to_visualize[name] = cv2.resize(to_visualize[name], (640, 480))
                         cv2.putText(
                             to_visualize[name],
                             org=(10, 25),
@@ -171,7 +169,7 @@ def rollout(
             if action_sequence is not None:
                 action_sequence = action_sequence.squeeze(1)  # remove batch dim
 
-        if action_sequence is not None and visualize:
+        if action_sequence is not None and visualize_3d:
             digital_twin.set_twin_pose(follower_pos, follower_pos + action_sequence.numpy())
 
         if step == 0:
@@ -194,7 +192,7 @@ def rollout(
                 next_action = action.clone()
                 is_dropped_cycle = True
 
-        if visualize:
+        if visualize_img:
             for name in to_visualize:
                 if is_dropped_cycle:
                     red = np.array([255, 0, 0], dtype=np.uint8)
@@ -210,6 +208,8 @@ def rollout(
                     to_visualize[name][:, -20:] = purple
                 cv2.imshow(name, cv2.cvtColor(to_visualize[name], cv2.COLOR_RGB2BGR))
                 k = cv2.waitKey(1)
+                if k == ord("p"):
+                    cv2.waitKey(0)
                 if k == ord("q"):
                     return
 
@@ -238,7 +238,7 @@ def rollout(
         else:
             busy_wait(period - elapsed - 0.001)
 
-        if visualize and digital_twin.quit_signal_is_set():
+        if visualize_3d and digital_twin.quit_signal_is_set():
             break
 
         if not is_warmup:
@@ -285,7 +285,7 @@ def rollout(
 
     policy_rollout_wrapper.close_thread()
 
-    if visualize:
+    if visualize_3d:
         digital_twin.close()
 
     return episode_data
@@ -300,7 +300,8 @@ def eval_policy(
     warmup_time_s: int = 0,
     use_relative_actions: bool = False,
     max_steps: int | None = None,
-    visualize: bool = False,
+    visualize_img: bool = False,
+    visualize_3d: bool = False,
     enable_progbar: bool = False,
 ) -> dict:
     assert isinstance(policy, nn.Module)
@@ -315,7 +316,8 @@ def eval_policy(
     progbar = trange(n_episodes, disable=not enable_progbar)
 
     for episode_index in progbar:
-        reset_for_joint_pos(robot)
+        # reset_for_joint_pos(robot)
+        reset_for_cube_push(robot)
 
         with torch.no_grad():
             episode_data = rollout(
@@ -326,7 +328,8 @@ def eval_policy(
                 warmup_s=warmup_time_s,
                 use_relative_actions=use_relative_actions,
                 max_steps=max_steps,
-                visualize=visualize,
+                visualize_img=visualize_img,
+                visualize_3d=visualize_3d,
             )
             # Continue the episode and data indices.
             episode_data["episode_index"] += episode_index

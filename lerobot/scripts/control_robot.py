@@ -132,7 +132,7 @@ from lerobot.common.rl import calc_reward_cube_push
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.utils import Robot
 from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
-from lerobot.common.vision import GoalSetter, HSVSegmenter
+from lerobot.common.vision import GoalSetter, segment_hsv
 from lerobot.scripts.eval import get_pretrained_policy_path
 from lerobot.scripts.push_dataset_to_hub import (
     push_dataset_card_to_hub,
@@ -432,7 +432,6 @@ def record(
 
         timestamp = time.perf_counter() - start_warmup_t
 
-    segmenter = HSVSegmenter()
     goal_setter = GoalSetter.from_mask_file("outputs/goal_mask.npy")
     goal_mask = goal_setter.get_goal_mask()
     where_goal = np.where(goal_mask > 0)
@@ -471,7 +470,7 @@ def record(
                     image_keys = [key for key in observation if "image" in key]
                     for key in image_keys:
                         img = observation[key].numpy()
-                        obj_mask, annotated_img = segmenter.segment(img)
+                        obj_mask, annotated_img = segment_hsv(img)
                         reward, success = calc_reward_cube_push(
                             obj_mask, goal_mask, (action["action"] - observation["observation.state"]).numpy()
                         )
