@@ -17,6 +17,7 @@ from tqdm import trange
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.policies.policy_protocol import Policy
 from lerobot.common.policies.rollout_wrapper import PolicyRolloutWrapper
+from lerobot.common.policies.tdmpc.modeling_tdmpc import TDMPCPolicy
 from lerobot.common.policies.utils import get_device_from_parameters
 from lerobot.common.rl import calc_reward_joint_goal, reset_for_joint_pos
 from lerobot.common.robot_devices.robots.factory import make_robot
@@ -106,7 +107,7 @@ def rollout(
                     episode_data["action"][-1],
                     prior_action,
                     first_order_smoothness_coeff=0,
-                    second_order_smoothness_coeff=-0.01,
+                    second_order_smoothness_coeff=-0.04,
                 )
                 print("REWARD:", reward, ", SUCCESS:", success)
                 episode_data["next.reward"].append(reward)
@@ -155,6 +156,10 @@ def rollout(
                 if step > 0
                 else None
             )
+            # Hack. We don't want to warm start the policy as that feature currently assumes warm starting
+            # with the most recent step's inference.
+            if isinstance(policy, TDMPCPolicy):
+                policy.reset()
             action_sequence = policy_rollout_wrapper.provide_observation_get_actions(
                 observation,
                 observation_timestamp=start_step_time,
@@ -252,13 +257,31 @@ def rollout(
     for k in episode_data:
         episode_data[k] = np.stack(episode_data[k])
 
-    episode_data["next.done"][-1] = True
-
     # Hack: drop the first frame because of first inference being slow.
     for k in episode_data:
         episode_data[k] = episode_data[k][1:]
     episode_data["frame_index"] -= 1
     episode_data["index"] -= 1
+
+    # # Hack: Fill out the episode repeating the last observation, action, reward, and success status.
+    # # This allows me to effectively increase the magnitude of the success / OOB reward without confusing the
+    # reward predictor. But it may overwhelm the data buffer with frozen data points?
+    # deficit = max_steps - len(episode_data["index"])
+    # if max_steps is not None and deficit > 0:
+    #     episode_data["index"] = np.arange(max_steps)
+    #     episode_data["frame_index"] = np.arange(max_steps)
+    #     observation_keys = [k for k in episode_data if k.startswith("observation.")]
+    #     for k in ["next.reward", "next.success", "action", *observation_keys]:
+    #         episode_data[k] = np.concatenate(
+    #             [
+    #                 episode_data[k],
+    #                 np.pad(episode_data[k], [(0, 10)] + [(0, 0)] * (episode_data[k].ndim - 1), mode="edge")
+    #             ],
+    #             axis=0,
+    #         )
+    #     episode_data["next.done"] = np.zeros(max_steps, dtype=bool)
+
+    episode_data["next.done"][-1] = True
 
     policy_rollout_wrapper.close_thread()
 

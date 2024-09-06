@@ -7,13 +7,14 @@ import open3d as o3d
 from lerobot.common.kinematics import KochKinematics
 
 GREEN = np.array([0.5, 1.0, 0.5])
+BLUE = np.array([0.0, 0.0, 1.0])
 RED = np.array([1.0, 0.1, 0.1])
 PURPLE = np.array([0.8, 0, 0.8])
 LIGHT_GRAY = np.array([0.8, 0.8, 0.8])
 
 
 class DigitalTwin:
-    def __init__(self):
+    def __init__(self, window_name: str = "Digital Twin"):
         # Frames. All origins of robot link frames are at the center of the respective motor axis.
         # (W)orld
         # (B)ase # Bo is at the center of the motor axis of the shoulder pan motor.
@@ -122,7 +123,7 @@ class DigitalTwin:
 
         # Create a visualizer
         self.vis = o3d.visualization.VisualizerWithKeyCallback()
-        self.vis.create_window(window_name="Digital Twin", width=768, height=512)
+        self.vis.create_window(window_name=window_name, width=768, height=512)
         self.vis.add_geometry(self.floor)
         self.vis.add_geometry(self.base)
         self.vis.add_geometry(self.shoulder)
@@ -146,10 +147,10 @@ class DigitalTwin:
 
         # Set initial view control
         view_control = self.vis.get_view_control()
-        view_control.set_zoom(0.05)
+        view_control.set_zoom(0.025)
         view_control.set_up([0, 0, 1])
-        view_control.set_front([-1, -0.3, 0.8])  # Set camera looking towards the cube
-        view_control.set_lookat([0, 0, 0])  # Set camera focus point
+        view_control.set_front([0.2, -1, 0.3])  # Set camera looking towards the cube
+        view_control.set_lookat([0, 0, 0.05])  # Set camera focus point
 
     def set_quit(self, *_):
         self._do_quit = True
@@ -202,10 +203,19 @@ class DigitalTwin:
         for waypoint in self.waypoints:
             waypoint.translate([0, 0, -0.1], relative=False)
         # Set the necessary number of waypoints.
-        for waypoint, follower_pos in zip(self.waypoints, follower_pos_trajectory, strict=False):
+        for i, (waypoint, follower_pos) in enumerate(
+            zip(self.waypoints, follower_pos_trajectory, strict=False)
+        ):
             pos = KochKinematics.fk_gripper(follower_pos)[:3, 3]
             waypoint.translate(pos, relative=False)
             self.vis.update_geometry(waypoint)
+            waypoint.paint_uniform_color(
+                np.clip(
+                    (1 - i / len(follower_pos_trajectory)) * BLUE + (i / len(follower_pos_trajectory)) * RED,
+                    0,
+                    1,
+                )
+            )
 
     def close(self):
         self.vis.destroy_window()

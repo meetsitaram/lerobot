@@ -95,7 +95,7 @@ def calc_reward_joint_goal(
 
     gripper_tip_pos = KochKinematics.fk_gripper_tip(current_joint_pos)[:3, -1]
     if not is_in_bounds(gripper_tip_pos):
-        reward -= 1
+        reward -= 5
         do_terminate = True
 
     if success:

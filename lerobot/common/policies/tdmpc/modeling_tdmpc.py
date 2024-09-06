@@ -144,11 +144,6 @@ class TDMPCPolicy(
     def run_inference(self, observation_batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
         observation_batch = self.normalize_inputs(observation_batch)
-        if self.expected_image_key is not None:
-            observation_batch = dict(
-                observation_batch
-            )  # shallow copy so that adding a key doesn't modify the original
-            observation_batch[self.expected_image_key] = observation_batch[self.expected_image_key]
 
         # Remove the time dimensions as it is not handled yet.
         for key in observation_batch:
