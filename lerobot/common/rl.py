@@ -8,7 +8,7 @@ from lerobot.common.robot_devices.robots.koch import KochRobot
 from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.vision import segment_hsv
 
-GRIPPER_TIP_Z_BOUNDS = (0.004, 0.05)
+GRIPPER_TIP_Z_BOUNDS = (0.005, 0.05)
 GRIPPER_TIP_X_BOUNDS = (-0.15, 0.15)
 GRIPPER_TIP_Y_BOUNDS = (-0.25, -0.05)
 GRIPPER_TIP_BOUNDS = np.row_stack([GRIPPER_TIP_X_BOUNDS, GRIPPER_TIP_Y_BOUNDS, GRIPPER_TIP_Z_BOUNDS])
@@ -80,7 +80,7 @@ def calc_reward_cube_push(
 
     if success:
         do_terminate = True
-        reward += 1
+        reward += 5
 
     if action is not None:
         reward += calc_smoothness_reward(
@@ -127,12 +127,14 @@ def calc_reward_joint_goal(
     return reward, success, do_terminate
 
 
-def _go_to_pos(robot, pos):
+def _go_to_pos(robot, pos, tol=None):
+    if tol is None:
+        tol = np.array([3, 3, 3, 10, 3, 3])
     while True:
         robot.send_action(pos)
         current_pos = robot.follower_arms["main"].read("Present_Position")
         busy_wait(1 / 30)
-        if np.all(np.abs(current_pos - pos.numpy()) < np.array([3, 3, 3, 10, 3, 3])):
+        if np.all(np.abs(current_pos - pos.numpy()) < tol):
             break
 
 
@@ -160,7 +162,7 @@ def reset_for_cube_push(robot: KochRobot):
         reset_pos = torch.tensor(
             [
                 np.random.uniform(125, 135),
-                np.random.uniform(60, 64),
+                np.random.uniform(62, 66),
                 np.random.uniform(64, 66),
                 np.random.uniform(78, 98),
                 np.random.uniform(-41, -31),
@@ -174,12 +176,12 @@ def reset_for_cube_push(robot: KochRobot):
             break
     intermediate_pos = torch.from_numpy(robot.follower_arms["main"].read("Present_Position"))
     intermediate_pos[1:] = staging_pos[1:]
-    _go_to_pos(robot, intermediate_pos)
+    _go_to_pos(robot, intermediate_pos, tol=np.array([5, 5, 5, 10, 5, 5]))
     if staging_pos[0] > intermediate_pos[0]:
-        _go_to_pos(robot, staging_pos)
+        _go_to_pos(robot, staging_pos, tol=np.array([5, 5, 5, 10, 5, 5]))
     intermediate_pos = staging_pos.clone()
     intermediate_pos[0] = reset_pos[0]
-    _go_to_pos(robot, intermediate_pos)
+    _go_to_pos(robot, intermediate_pos, tol=np.array([5, 5, 5, 10, 5, 5]))
     _go_to_pos(robot, reset_pos)
 
 

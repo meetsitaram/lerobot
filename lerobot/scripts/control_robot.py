@@ -132,7 +132,7 @@ from lerobot.common.rl import calc_reward_cube_push
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.utils import Robot
 from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
-from lerobot.common.vision import GoalSetter, segment_hsv
+from lerobot.common.vision import GoalSetter
 from lerobot.scripts.eval import get_pretrained_policy_path
 from lerobot.scripts.push_dataset_to_hub import (
     push_dataset_card_to_hub,
@@ -448,6 +448,7 @@ def record(
             frame_index = 0
             timestamp = 0
             start_episode_t = time.perf_counter()
+            prior_relative_action = None
             while timestamp < episode_time_s:
                 start_loop_t = time.perf_counter()
 
@@ -469,11 +470,18 @@ def record(
                 if not is_headless():
                     image_keys = [key for key in observation if "image" in key]
                     for key in image_keys:
-                        img = observation[key].numpy()
-                        obj_mask, annotated_img = segment_hsv(img)
-                        reward, success = calc_reward_cube_push(
-                            obj_mask, goal_mask, (action["action"] - observation["observation.state"]).numpy()
+                        this_relative_action = (action["action"] - observation["observation.state"]).numpy()
+                        reward, success, do_terminate, info = calc_reward_cube_push(
+                            img=observation[key].numpy(),
+                            goal_mask=goal_mask,
+                            current_joint_pos=observation["observation.state"].numpy(),
+                            action=this_relative_action,
+                            prior_action=prior_relative_action,
+                            first_order_smoothness_coeff=0,
+                            second_order_smoothness_coeff=-0.02,
                         )
+                        prior_relative_action = this_relative_action.copy()
+                        annotated_img = info["annotated_img"]
                         annotated_img[where_goal] = (
                             annotated_img[where_goal]
                             - (annotated_img[where_goal] - np.array([255, 255, 255])) // 2
@@ -493,6 +501,9 @@ def record(
                         ep_dict["next.success"].append(success)
                         if success:
                             say("Goal accomplished.", blocking=True)
+                            exit_early = True
+                        elif do_terminate:
+                            say("Failed.", blocking=True)
                             exit_early = True
                     cv2.waitKey(1)
 

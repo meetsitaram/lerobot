@@ -23,12 +23,9 @@ def screw_axis_to_transform(S, theta):
         T = np.eye(4)
         T[:3, 3] = S_v * theta
     elif np.linalg.norm(S_w) == 1:  # Rotation and translation
-        R = rodrigues_rotation(S_w, theta)
-        t = (
-            np.eye(3) * theta
-            + (1 - np.cos(theta)) * skew_symmetric(S_w)
-            + (theta - np.sin(theta)) * skew_symmetric(S_w) @ skew_symmetric(S_w)
-        ) @ S_v
+        w_hat = skew_symmetric(S_w)
+        R = np.eye(3) + np.sin(theta) * w_hat + (1 - np.cos(theta)) * w_hat @ w_hat
+        t = (np.eye(3) * theta + (1 - np.cos(theta)) * w_hat + (theta - np.sin(theta)) * w_hat @ w_hat) @ S_v
         T = np.eye(4)
         T[:3, :3] = R
         T[:3, 3] = t
@@ -66,6 +63,15 @@ def pose_difference_se3(pose1, pose2):
     rotation_diff = R_diff.as_rotvec()  # Convert to axis-angle representation
 
     return np.concatenate([translation_diff, rotation_diff])
+
+
+def se3_error(target_pose, current_pose):
+    pos_error = target_pose[:3, 3] - current_pose[:3, 3]
+    R_target = target_pose[:3, :3]
+    R_current = current_pose[:3, :3]
+    R_error = R_target @ R_current.T
+    rot_error = Rotation.from_matrix(R_error).as_rotvec()
+    return np.concatenate([pos_error, rot_error])
 
 
 class KochKinematics:
@@ -226,6 +232,8 @@ class KochKinematics:
         ]
     )
 
+    _fk_gripper_post = X_GoGc @ X_BoGo @ gripper_X0
+
     @staticmethod
     def fk_base():
         return KochKinematics.X_WoBo @ KochKinematics.X_BoBc @ KochKinematics.base_X0
@@ -287,9 +295,7 @@ class KochKinematics:
             @ screw_axis_to_transform(KochKinematics.S_BF, robot_pos_rad[2])
             @ screw_axis_to_transform(KochKinematics.S_BR, robot_pos_rad[3])
             @ screw_axis_to_transform(KochKinematics.S_BG, robot_pos_rad[4])
-            @ KochKinematics.X_GoGc
-            @ KochKinematics.X_BoGo
-            @ KochKinematics.gripper_X0
+            @ KochKinematics._fk_gripper_post
         )
 
     @staticmethod
@@ -312,21 +318,58 @@ class KochKinematics:
         """Finite differences to compute the Jacobian.
         J(i, j) represents how the ith component of the end-effector's velocity changes wrt a small change
         in the jth joint's velocity.
-
-        TODO: This is probably wrong lol
         """
         eps = 1e-8
-        jac = []
-        for el_ix in range(len(robot_pos_deg)):
-            delta = np.zeros(len(robot_pos_deg), dtype=np.float64)
+        jac = np.zeros(shape=(6, 5))
+        delta = np.zeros(len(robot_pos_deg[:-1]), dtype=np.float64)
+        for el_ix in range(len(robot_pos_deg[:-1])):
+            delta *= 0
             delta[el_ix] = eps / 2
             Sdot = (
                 pose_difference_se3(
-                    KochKinematics.fk_gripper(robot_pos_deg + delta),
-                    KochKinematics.fk_gripper(robot_pos_deg - delta),
+                    KochKinematics.fk_gripper(robot_pos_deg[:-1] + delta),
+                    KochKinematics.fk_gripper(robot_pos_deg[:-1] - delta),
                 )
                 / eps
             )
-            jac.append(Sdot)
-        jac = np.column_stack(jac)
+            jac[:, el_ix] = Sdot
         return jac
+
+    @staticmethod
+    def pos_jac_gripper(robot_pos_deg):
+        """Finite differences to compute the Jacobian.
+        J(i, j) represents how the ith component of the end-effector's velocity changes wrt a small change
+        in the jth joint's velocity.
+        """
+        eps = 1e-8
+        jac = np.zeros(shape=(3, 5))
+        delta = np.zeros(len(robot_pos_deg[:-1]), dtype=np.float64)
+        for el_ix in range(len(robot_pos_deg[:-1])):
+            delta *= 0
+            delta[el_ix] = eps / 2
+            Sdot = (
+                KochKinematics.fk_gripper(robot_pos_deg[:-1] + delta)[:3, 3]
+                - KochKinematics.fk_gripper(robot_pos_deg[:-1] - delta)[:3, 3]
+            ) / eps
+            jac[:, el_ix] = Sdot
+        return jac
+
+    @staticmethod
+    def ik(current_joint_state, desired_ee_pose, position_only=True):
+        # Do gradient descent.
+        max_iterations = 5
+        learning_rate = 1
+        for _ in range(max_iterations):
+            current_ee_pose = KochKinematics.fk_gripper(current_joint_state)
+            if not position_only:
+                error = se3_error(desired_ee_pose, current_ee_pose)
+                jac = KochKinematics.jac_gripper(current_joint_state)
+            else:
+                error = desired_ee_pose[:3, 3] - current_ee_pose[:3, 3]
+                jac = KochKinematics.pos_jac_gripper(current_joint_state)
+            delta_angles = np.linalg.pinv(jac) @ error
+            current_joint_state[:-1] += learning_rate * delta_angles
+
+            if np.linalg.norm(error) < 5e-3:
+                return current_joint_state
+        return current_joint_state

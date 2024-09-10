@@ -25,6 +25,7 @@ from lerobot.common.rl import (
 )
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.koch import KochRobot
+from lerobot.common.robot_devices.teleoperators.ps5_controller import PS5Controller
 from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.digital_twin import DigitalTwin
 from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
@@ -63,11 +64,14 @@ def rollout(
 
     episode_data = defaultdict(list)
 
+    ps5_controller = PS5Controller(robot)
+
     period = 1 / fps
     to_visualize = {}
     reward = 0
     success = False
     first_follower_pos = None  # Will be held during the warmup
+    prior_absolute_action = None
     while True:
         is_dropped_cycle = False
         over_time = False
@@ -213,24 +217,45 @@ def rollout(
                 if k == ord("q"):
                     return
 
+        # Decide whether to break out.
+        if max_steps is not None and step >= max_steps:
+            episode_data["next.done"][-1] = True
+        if len(episode_data["next.done"]) > 0 and episode_data["next.done"][-1]:
+            # At this point we have collected all keys for the last frame except for the action. Add the last
+            # action as zeros
+            episode_data["action"] = np.concatenate(
+                [episode_data["action"], np.zeros_like(episode_data["action"][-1:])]
+            )
+            break
+
         # Order the robot to move
         if is_warmup:
             policy_rollout_wrapper.reset()
             robot.send_action(torch.from_numpy(first_follower_pos))
             logging.info("Warming up.")
         else:
+            ps5_action = ps5_controller.read(
+                prior_absolute_action.numpy() if prior_absolute_action is not None else first_follower_pos
+            )  # absolute
+            if ps5_action is not None:
+                action = ps5_action - follower_pos if use_relative_actions else torch.from_numpy(ps5_action)
+
             if use_relative_actions:
                 relative_action = action
-                action = torch.from_numpy(follower_pos) + relative_action
+                absolute_action = torch.from_numpy(follower_pos) + relative_action
+            else:
+                absolute_action = action
 
             # The robot may itself clamp the action, and return the appropriate action.
-            action = robot.send_action(action)
+            absolute_action = robot.send_action(absolute_action)
 
             if use_relative_actions:
-                relative_action = action - torch.from_numpy(follower_pos)
+                relative_action = absolute_action - torch.from_numpy(follower_pos)
                 episode_data["action"].append(relative_action.numpy())
             else:
-                episode_data["action"].append(action.numpy())
+                episode_data["action"].append(absolute_action.numpy())
+
+            prior_absolute_action = absolute_action.clone()
 
         elapsed = to_relative_time(time.perf_counter()) - start_step_time
         if elapsed > period:
@@ -244,12 +269,7 @@ def rollout(
         if not is_warmup:
             step += 1
 
-        if max_steps is not None and step >= max_steps:
-            episode_data["next.done"][-1] = True
-
-        if len(episode_data["next.done"]) > 0 and episode_data["next.done"][-1]:
-            break
-
+    # Pad the "next" keys with a copy of the last one. They should not be accessed anyway.
     for k in episode_data:
         if k.startswith("next."):
             episode_data[k].append(episode_data[k][-1])
@@ -263,25 +283,29 @@ def rollout(
     episode_data["frame_index"] -= 1
     episode_data["index"] -= 1
 
-    # # Hack: Fill out the episode repeating the last observation, action, reward, and success status.
-    # # This allows me to effectively increase the magnitude of the success / OOB reward without confusing the
+    # HACK: Fill out the episode repeating the last observation, action, reward, and success status.
+    # This allows me to effectively increase the magnitude of the success / OOB reward without confusing the
     # reward predictor. But it may overwhelm the data buffer with frozen data points?
     # deficit = max_steps - len(episode_data["index"])
-    # if max_steps is not None and deficit > 0:
-    #     episode_data["index"] = np.arange(max_steps)
-    #     episode_data["frame_index"] = np.arange(max_steps)
-    #     observation_keys = [k for k in episode_data if k.startswith("observation.")]
-    #     for k in ["next.reward", "next.success", "action", *observation_keys]:
-    #         episode_data[k] = np.concatenate(
-    #             [
-    #                 episode_data[k],
-    #                 np.pad(episode_data[k], [(0, 10)] + [(0, 0)] * (episode_data[k].ndim - 1), mode="edge")
-    #             ],
-    #             axis=0,
-    #         )
-    #     episode_data["next.done"] = np.zeros(max_steps, dtype=bool)
+    deficit = policy.config.horizon - 1
+    if max_steps is not None and deficit > 0:
+        episode_data["index"] = np.arange(len(episode_data["index"]) + deficit)
+        episode_data["frame_index"] = np.arange(len(episode_data["frame_index"]) + deficit)
+        episode_data["episode_index"] = np.full(
+            (len(episode_data["episode_index"]) + deficit,), episode_data["episode_index"][0]
+        )
+        episode_data["timestamp"] = np.concatenate(
+            [episode_data["timestamp"], episode_data["timestamp"][-1] + (1 + np.arange(deficit)) / fps]
+        )
+        observation_keys = [k for k in episode_data if k.startswith("observation.")]
+        for k in ["next.reward", "next.success", "next.done", "action", *observation_keys]:
+            extra_kwargs = {"mode": "constant", "constant_values": 0} if k == "action" else {"mode": "edge"}
+            episode_data[k] = np.pad(
+                episode_data[k], [(0, deficit)] + [(0, 0)] * (episode_data[k].ndim - 1), **extra_kwargs
+            )
+        # episode_data["next.done"] = np.zeros(len(episode_data["next.done"]) + deficit, dtype=bool)
 
-    episode_data["next.done"][-1] = True
+    # episode_data["next.done"][-2:] = True
 
     policy_rollout_wrapper.close_thread()
 

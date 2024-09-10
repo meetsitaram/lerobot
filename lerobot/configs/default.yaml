@@ -71,6 +71,12 @@ training:
   online_rollout_batch_size: 1
   # How many optimization steps (forward, backward, optimizer step) to do between running rollouts.
   online_steps_between_rollouts: null
+  # Alternative parameterization to online_steps_between_rollouts. This dynamically sets the number of
+  # optimization steps to do between running rollouts based on the number of frames added by the last set of
+  # rollouts.
+  # For example, if this is set to 2, and the the number of frames added by the last set of rollouts is 100,
+  # 200 update steps are made.
+  online_update_to_data_ratio: null
   # The proportion of online samples (vs offline samples) to include in the online training batches.
   online_sampling_ratio: 0.5
   # First seed to use for the online rollout environment. Seeds for subsequent rollouts are incremented by 1.

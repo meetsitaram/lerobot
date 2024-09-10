@@ -275,6 +275,15 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     if cfg.training.online_steps > 0 and isinstance(cfg.dataset_repo_id, ListConfig):
         raise NotImplementedError("Online training with LeRobotMultiDataset is not implemented.")
 
+    if cfg.training.online_steps > 0 and not (
+        (cfg.training.online_steps_between_rollouts is None)
+        ^ (cfg.training.online_update_to_data_ratio is None)
+    ):
+        raise ValueError(
+            "Exactly one of `online_steps_between_rollouts` and `online_update_to_data_ratio` must be "
+            "set when `online_steps` > 0."
+        )
+
     # If we are resuming a run, we need to check that a checkpoint exists in the log directory, and we need
     # to check for any differences between the provided config and the checkpoint's config.
     if cfg.resume:
@@ -594,13 +603,14 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         fps=FPS,  # online_env.unwrapped.metadata["render_fps"],
         delta_timestamps=cfg.training.delta_timestamps,
     )
-    # # TODO(now): Hack
-    # for k in online_dataset._data:
-    #     if k == OnlineBuffer.NEXT_INDEX_KEY:
-    #         online_dataset._data[k] = len(offline_dataset_cache)
-    #     else:
-    #         fill = offline_dataset_cache._data[k]
-    #         online_dataset._data[k][: len(fill)] = offline_dataset_cache._data[k]
+
+    if not cfg.resume and cfg.training.do_seed_online_buffer_with_offline_data:
+        for k in online_dataset._data:
+            if k == OnlineBuffer.NEXT_INDEX_KEY:
+                online_dataset._data[k] = len(offline_dataset_cache)
+            else:
+                fill = offline_dataset_cache._data[k]
+                online_dataset._data[k][: len(fill)] = offline_dataset_cache._data[k]
 
     # If we are doing online rollouts asynchronously, deepcopy the policy to use for online rollouts (this
     # makes it possible to do online rollouts in parallel with training updates).
@@ -709,7 +719,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
                 update_online_buffer_s = time.perf_counter() - start_update_buffer_time
 
-            return online_rollout_s, update_online_buffer_s
+            return online_rollout_s, update_online_buffer_s, len(eval_info["episodes"]["index"])
 
         future = executor.submit(sample_trajectory_and_update_buffer)
         # If we aren't doing async rollouts, or if we haven't yet gotten enough examples in our buffer, wait
@@ -718,7 +728,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             not cfg.training.do_online_rollout_async
             or len(online_dataset) <= cfg.training.online_buffer_seed_size
         ):
-            online_rollout_s, update_online_buffer_s = future.result()
+            online_rollout_s, update_online_buffer_s, n_new_frames = future.result()
 
         if len(online_dataset) <= cfg.training.online_buffer_seed_size:
             logging.info(
@@ -726,8 +736,14 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             )
             continue
 
+        if cfg.training.online_steps_between_rollouts is not None:
+            n_update_steps = cfg.training.online_steps_between_rollouts
+        elif cfg.training.online_update_to_data_ratio is not None:
+            n_update_steps = int(round(cfg.training.online_update_to_data_ratio * n_new_frames))
+        else:
+            raise AssertionError
         policy.train()
-        for _ in range(cfg.training.online_steps_between_rollouts):
+        for _ in range(n_update_steps):
             with lock:
                 start_time = time.perf_counter()
                 batch = next(dl_iter)
@@ -768,7 +784,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         # to do the next batch of rollouts.
         if future.running():
             start = time.perf_counter()
-            online_rollout_s, update_online_buffer_s = future.result()
+            online_rollout_s, update_online_buffer_s, n_new_frames = future.result()
             await_update_online_buffer_s = time.perf_counter() - start
 
         if online_step >= cfg.training.online_steps:

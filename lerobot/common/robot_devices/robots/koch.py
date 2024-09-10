@@ -569,6 +569,7 @@ class KochRobot:
                 follower_goal_pos[name] = safe_action.numpy()
             else:
                 follower_goal_pos[name] = this_action.numpy()
+                safe_action = this_action.numpy()
 
             from_idx = to_idx
 
