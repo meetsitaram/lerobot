@@ -8,7 +8,7 @@ from lerobot.common.robot_devices.robots.koch import KochRobot
 from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.vision import segment_hsv
 
-GRIPPER_TIP_Z_BOUNDS = (0.005, 0.05)
+GRIPPER_TIP_Z_BOUNDS = (0.005, 0.06)
 GRIPPER_TIP_X_BOUNDS = (-0.15, 0.15)
 GRIPPER_TIP_Y_BOUNDS = (-0.25, -0.05)
 GRIPPER_TIP_BOUNDS = np.row_stack([GRIPPER_TIP_X_BOUNDS, GRIPPER_TIP_Y_BOUNDS, GRIPPER_TIP_Z_BOUNDS])
@@ -40,19 +40,22 @@ def calc_reward_cube_push(
     img,
     goal_mask,
     current_joint_pos,
-    distance_reward_coeff: float = 1 / 45,
+    distance_reward_coeff: float = 1 / 24,
     action: np.ndarray | None = None,
     prior_action: np.ndarray | None = None,
     first_order_smoothness_coeff: float = -1.0,
     second_order_smoothness_coeff: float = -1.0,
+    oob_reward: float = -5.0,
+    occlusion_limit=55,
+    occlusion_reward=-3.0,
 ) -> tuple[float, bool, bool, dict]:
     obj_mask, annotated_img = segment_hsv(img)
 
-    if np.count_nonzero(obj_mask) >= 10:
+    if np.count_nonzero(obj_mask) >= occlusion_limit:
         intersection_area = np.count_nonzero(np.bitwise_and(obj_mask, goal_mask))
 
         success = False
-        if intersection_area <= 0:
+        if intersection_area <= occlusion_limit:
             # Find the minimum distance between the object and the goal.
             goal_contour = cv2.findContours(
                 goal_mask.astype(np.uint8), mode=cv2.RETR_EXTERNAL, method=cv2.CHAIN_APPROX_SIMPLE
@@ -69,14 +72,14 @@ def calc_reward_cube_push(
             success = reward == 1
     else:
         success = False
-        reward = -3
+        reward = occlusion_reward
 
     do_terminate = False
 
     gripper_tip_pos = KochKinematics.fk_gripper_tip(current_joint_pos)[:3, -1]
     if not is_in_bounds(gripper_tip_pos):
         do_terminate = True
-        reward -= 5
+        reward += oob_reward
 
     if success:
         do_terminate = True
@@ -155,17 +158,17 @@ def reset_for_joint_pos(robot: KochRobot):
     _go_to_pos(robot, reset_pos)
 
 
-def reset_for_cube_push(robot: KochRobot):
+def reset_for_cube_push(robot: KochRobot, right=True):
     robot.follower_arms["main"].write("Torque_Enable", TorqueMode.ENABLED.value)
     staging_pos = torch.tensor([90, 100, 60, 65, 3, 30]).float()
     while True:
         reset_pos = torch.tensor(
             [
-                np.random.uniform(125, 135),
+                np.random.uniform(125, 135) if right else np.random.uniform(45, 55),
                 np.random.uniform(62, 66),
                 np.random.uniform(64, 66),
                 np.random.uniform(78, 98),
-                np.random.uniform(-41, -31),
+                np.random.uniform(-41, -31) if right else np.random.uniform(31, 41),
                 np.random.uniform(0, 20),
             ]
         ).float()
@@ -177,7 +180,9 @@ def reset_for_cube_push(robot: KochRobot):
     intermediate_pos = torch.from_numpy(robot.follower_arms["main"].read("Present_Position"))
     intermediate_pos[1:] = staging_pos[1:]
     _go_to_pos(robot, intermediate_pos, tol=np.array([5, 5, 5, 10, 5, 5]))
-    if staging_pos[0] > intermediate_pos[0]:
+    if right and staging_pos[0] > intermediate_pos[0]:  # noqa: SIM114
+        _go_to_pos(robot, staging_pos, tol=np.array([5, 5, 5, 10, 5, 5]))
+    elif (not right) and staging_pos[0] < intermediate_pos[0]:
         _go_to_pos(robot, staging_pos, tol=np.array([5, 5, 5, 10, 5, 5]))
     intermediate_pos = staging_pos.clone()
     intermediate_pos[0] = reset_pos[0]
@@ -191,5 +196,6 @@ if __name__ == "__main__":
 
     robot = make_robot(init_hydra_config("lerobot/configs/robot/koch_.yaml"))
     robot.connect()
-    reset_for_cube_push(robot)
+    reset_for_cube_push(robot, right=True)
+    reset_for_cube_push(robot, right=False)
     robot.disconnect()

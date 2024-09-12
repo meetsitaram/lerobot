@@ -1,6 +1,9 @@
 import argparse
 import json
 import logging
+import os
+import platform
+import random
 import time
 from collections import defaultdict
 from datetime import datetime as dt
@@ -33,6 +36,26 @@ from lerobot.common.vision import GoalSetter
 from lerobot.scripts.eval import get_pretrained_policy_path
 
 
+def say(text, blocking=False):
+    # Check if mac, linux, or windows.
+    if platform.system() == "Darwin":
+        cmd = f'say "{text}"'
+    elif platform.system() == "Linux":
+        cmd = f'spd-say "{text}"'
+    elif platform.system() == "Windows":
+        cmd = (
+            'PowerShell -Command "Add-Type -AssemblyName System.Speech; '
+            f"(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{text}')\""
+        )
+
+    if not blocking and platform.system() in ["Darwin", "Linux"]:
+        # TODO(rcadene): Make it work for Windows
+        # Use the ampersand to run command in the background
+        cmd += " &"
+
+    os.system(cmd)
+
+
 def rollout(
     robot: KochRobot,
     policy: Policy,
@@ -44,9 +67,46 @@ def rollout(
     visualize_img: bool = False,
     visualize_3d: bool = False,
 ) -> dict:
-    goal_setter = GoalSetter.from_mask_file("outputs/goal_mask.npy")
-    goal_mask = goal_setter.get_goal_mask()
-    where_goal = np.where(goal_mask > 0)
+    goal_setter_left = GoalSetter.from_mask_file("outputs/goal_mask_left.npy")
+    goal_setter_right = GoalSetter.from_mask_file("outputs/goal_mask_right.npy")
+    goal_mask_left = goal_setter_left.get_goal_mask()
+    goal_mask_right = goal_setter_right.get_goal_mask()
+
+    observation: dict[str, torch.Tensor] = robot.capture_observation()
+    reward_left, *_ = calc_reward_cube_push(
+        img=observation["observation.images.webcam"].numpy(),
+        goal_mask=goal_mask_left,
+        current_joint_pos=observation["observation.state"].numpy(),
+        oob_reward=0,
+        occlusion_reward=0,
+    )
+    reward_right, *_ = calc_reward_cube_push(
+        img=observation["observation.images.webcam"].numpy(),
+        goal_mask=goal_mask_right,
+        current_joint_pos=observation["observation.state"].numpy(),
+        oob_reward=0,
+        occlusion_reward=0,
+    )
+    if reward_left > -0.5:  # The block is on the left
+        goal_mask = goal_mask_right  # Goal is on the right
+        goal = "right"
+        start_pos = "left"
+    elif reward_right > -0.5:  # The block is on the right
+        goal_mask = goal_mask_left  # goal is on the left
+        goal = "left"
+        start_pos = "right"
+    elif random.random() > 0.5:
+        goal_mask = goal_mask_right  # goal is on the right
+        goal = "right"
+        start_pos = "left" if random.random() < 0.9 else "right"  # make it more likely to start left
+    else:
+        goal_mask = goal_mask_left  # goal is on the left
+        goal = "left"
+        start_pos = "right" if random.random() < 0.9 else "left"  # make it more likely to start right
+    say(f"Go {goal}", blocking=True)
+    reset_for_cube_push(robot, right=start_pos == "right")
+
+    where_goal = torch.where(torch.from_numpy(goal_mask) > 0)
 
     if visualize_3d:
         digital_twin = DigitalTwin()
@@ -64,7 +124,7 @@ def rollout(
 
     episode_data = defaultdict(list)
 
-    ps5_controller = PS5Controller(robot)
+    ps5_controller = PS5Controller()
 
     period = 1 / fps
     to_visualize = {}
@@ -72,12 +132,14 @@ def rollout(
     success = False
     first_follower_pos = None  # Will be held during the warmup
     prior_absolute_action = None
+    surrender_control = False
     while True:
         is_dropped_cycle = False
         over_time = False
         start_step_time = to_relative_time(time.perf_counter())
         is_warmup = start_step_time <= warmup_s
         observation: dict[str, torch.Tensor] = robot.capture_observation()
+
         annotated_img = None
         if not is_warmup:
             episode_data["index"].append(step)
@@ -86,7 +148,10 @@ def rollout(
             episode_data["frame_index"].append(step)
             for k in observation:
                 if k.startswith("observation.image"):
-                    episode_data[k].append(observation[k].permute(2, 0, 1).numpy().astype(float) / 255.0)
+                    # HACK use masking to indicate to policy which side needs the cube:
+                    img = observation[k].to(dtype=torch.float32) / 255.0
+                    img[where_goal] = img[where_goal] / 2 + 0.5
+                    episode_data[k].append(img.permute(2, 0, 1).contiguous().numpy())
                 else:
                     episode_data[k].append(observation[k].numpy())
 
@@ -105,9 +170,6 @@ def rollout(
                     second_order_smoothness_coeff=-0.02,
                 )
                 annotated_img = info["annotated_img"]
-                annotated_img[where_goal] = (
-                    annotated_img[where_goal] - (annotated_img[where_goal] - np.array([255, 255, 255])) // 2
-                )
                 # reward, success, do_terminate = calc_reward_joint_goal(
                 #     observation["observation.state"].numpy(),
                 #     episode_data["action"][-1],
@@ -119,6 +181,11 @@ def rollout(
                 episode_data["next.reward"].append(reward)
                 episode_data["next.success"].append(success)
                 episode_data["next.done"].append(success or do_terminate)
+
+        if annotated_img is None:
+            annotated_img = observation["observation.images.webcam"].numpy()
+
+        annotated_img[where_goal] = annotated_img[where_goal] // 2 + np.array([127, 127, 127])
 
         follower_pos = observation["observation.state"].numpy()
         if first_follower_pos is None:
@@ -133,8 +200,9 @@ def rollout(
         for name in observation:
             if name.startswith("observation.image"):
                 if visualize_img:
-                    to_visualize[name] = observation[name].numpy() if annotated_img is None else annotated_img
+                    to_visualize[name] = annotated_img
                     to_visualize[name] = cv2.resize(to_visualize[name], (640, 480))
+                    to_visualize[name] = cv2.rotate(to_visualize[name], cv2.ROTATE_180)
                     if start_step_time > warmup_s:
                         cv2.putText(
                             to_visualize[name],
@@ -146,6 +214,8 @@ def rollout(
                             thickness=1,
                         )
                 observation[name] = observation[name].type(torch.float32) / 255
+                # HACK use masking to indicate to policy which side needs the cube:
+                observation[name][where_goal] = observation[name][where_goal] / 2 + 0.5
                 observation[name] = observation[name].permute(2, 0, 1).contiguous()
             observation[name] = observation[name].unsqueeze(0)
             observation[name] = observation[name].to(device)
@@ -158,10 +228,11 @@ def rollout(
                 if step > 0
                 else None
             )
-            # Hack. We don't want to warm start the policy as that feature currently assumes warm starting
+            # HACK. We don't want to warm start the policy as that feature currently assumes warm starting
             # with the most recent step's inference.
             if isinstance(policy, TDMPCPolicy):
                 policy.reset()
+
             action_sequence = policy_rollout_wrapper.provide_observation_get_actions(
                 observation,
                 observation_timestamp=start_step_time,
@@ -231,18 +302,29 @@ def rollout(
         # Order the robot to move
         if is_warmup:
             policy_rollout_wrapper.reset()
-            robot.send_action(torch.from_numpy(first_follower_pos))
+            absolute_action = torch.from_numpy(first_follower_pos)
+            robot.send_action(absolute_action)
             logging.info("Warming up.")
         else:
-            ps5_action = ps5_controller.read(
+            ps5_reference_joint_pos = (
                 prior_absolute_action.numpy() if prior_absolute_action is not None else first_follower_pos
-            )  # absolute
-            if ps5_action is not None:
-                action = ps5_action - follower_pos if use_relative_actions else torch.from_numpy(ps5_action)
+            )
+            ps5_action = ps5_controller.read(ps5_reference_joint_pos.copy())  # absolute
+            if ps5_controller.check_flag():
+                surrender_control = False
+            if ps5_action is not None or surrender_control:
+                surrender_control = True
+                if ps5_action is None:
+                    ps5_action = ps5_reference_joint_pos.copy()
+                action = (
+                    torch.from_numpy(ps5_action - follower_pos)
+                    if use_relative_actions
+                    else torch.from_numpy(ps5_action)
+                )
 
             if use_relative_actions:
                 relative_action = action
-                absolute_action = torch.from_numpy(follower_pos) + relative_action
+                absolute_action = relative_action + torch.from_numpy(follower_pos)
             else:
                 absolute_action = action
 
@@ -255,7 +337,12 @@ def rollout(
             else:
                 episode_data["action"].append(absolute_action.numpy())
 
-            prior_absolute_action = absolute_action.clone()
+            # if ps5_action is not None or surrender_control:
+            #     episode_data["is_teleop_step"].append(True)
+            # else:
+            #     episode_data["is_teleop_step"].append(False)
+
+        prior_absolute_action = absolute_action.clone()
 
         elapsed = to_relative_time(time.perf_counter()) - start_step_time
         if elapsed > period:
@@ -277,7 +364,7 @@ def rollout(
     for k in episode_data:
         episode_data[k] = np.stack(episode_data[k])
 
-    # Hack: drop the first frame because of first inference being slow.
+    # HACK: drop the first frame because of first inference being slow.
     for k in episode_data:
         episode_data[k] = episode_data[k][1:]
     episode_data["frame_index"] -= 1
@@ -288,7 +375,7 @@ def rollout(
     # reward predictor. But it may overwhelm the data buffer with frozen data points?
     # deficit = max_steps - len(episode_data["index"])
     deficit = policy.config.horizon - 1
-    if max_steps is not None and deficit > 0:
+    if do_terminate and deficit > 0:
         episode_data["index"] = np.arange(len(episode_data["index"]) + deficit)
         episode_data["frame_index"] = np.arange(len(episode_data["frame_index"]) + deficit)
         episode_data["episode_index"] = np.full(
@@ -340,9 +427,6 @@ def eval_policy(
     progbar = trange(n_episodes, disable=not enable_progbar)
 
     for episode_index in progbar:
-        # reset_for_joint_pos(robot)
-        reset_for_cube_push(robot)
-
         with torch.no_grad():
             episode_data = rollout(
                 robot,

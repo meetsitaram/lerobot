@@ -56,7 +56,7 @@ from lerobot.common.utils.utils import (
 )
 from lerobot.scripts.eval_real import eval_policy
 
-CLIP = np.array([5, 8, 6, 8, 6, 5])
+CLIP = np.array([5, 8, 10, 10, 12, 5])
 FPS = 20.0
 
 
@@ -303,7 +303,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         # Get the configuration file from the last checkpoint.
         checkpoint_cfg = init_hydra_config(checkpoint_cfg_path)
         # Check for differences between the checkpoint configuration and provided configuration.
-        # Hack to resolve the delta_timestamps ahead of time in order to properly diff.
+        # HACK to resolve the delta_timestamps ahead of time in order to properly diff.
         resolve_delta_timestamps(cfg)
         diff = DeepDiff(OmegaConf.to_container(checkpoint_cfg), OmegaConf.to_container(cfg))
         # Ignore the `resume` and parameters.
@@ -679,7 +679,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                     n_action_buffer=2,
                     warmup_time_s=1,
                     use_relative_actions=True,
-                    max_steps=150,
+                    max_steps=200,
                     visualize_img=True,
                     visualize_3d=False,
                 )
@@ -701,6 +701,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             with lock:
                 start_update_buffer_time = time.perf_counter()
                 online_dataset.add_data(eval_info["episodes"])
+                online_dataset.flush()
 
                 # Update the concatenated dataset length used during sampling.
                 concat_dataset.cumulative_sizes = concat_dataset.cumsum(concat_dataset.datasets)
@@ -712,7 +713,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                     online_dataset=online_dataset,
                     # +1 because online rollouts return an extra frame for the "final observation". Note: we don't have
                     # this final observation in the offline datasets, but we might add them in future.
-                    online_drop_n_last_frames=cfg.training.get("drop_n_last_frames", 0) + 1,
+                    online_drop_n_last_frames=cfg.training.get("drop_n_last_frames", 0),
                     online_sampling_ratio=cfg.training.online_sampling_ratio,
                 )
                 sampler.num_samples = len(concat_dataset)
