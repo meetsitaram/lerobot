@@ -9,8 +9,8 @@ from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.vision import segment_hsv
 
 GRIPPER_TIP_Z_BOUNDS = (0.005, 0.06)
-GRIPPER_TIP_X_BOUNDS = (-0.15, 0.15)
-GRIPPER_TIP_Y_BOUNDS = (-0.25, -0.05)
+GRIPPER_TIP_X_BOUNDS = (-0.16, 0.16)
+GRIPPER_TIP_Y_BOUNDS = (-0.25, -0.06)
 GRIPPER_TIP_BOUNDS = np.row_stack([GRIPPER_TIP_X_BOUNDS, GRIPPER_TIP_Y_BOUNDS, GRIPPER_TIP_Z_BOUNDS])
 
 

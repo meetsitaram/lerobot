@@ -168,50 +168,111 @@ class OnlineBuffer(torch.utils.data.Dataset):
             complete_data_spec[k] = {"dtype": v["dtype"], "shape": (buffer_capacity, *v["shape"])}
         return complete_data_spec
 
+    # def add_data(self, data: dict[str, np.ndarray]):
+    #     """Add new data to the buffer, which could potentially mean shifting old data out.
+
+    #     The new data should contain all the frames (in order) of any number of episodes. The indices should
+    #     start from 0 (note to the developer: this can easily be generalized). See the `rollout` and
+    #     `eval_policy` functions in `eval.py` for more information on how the data is constructed.
+
+    #     Shift the incoming data index and episode_index to continue on from the last frame. Note that this
+    #     will be done in place!
+    #     """
+    #     if len(missing_keys := (set(self.data_keys).difference(set(data)))) > 0:
+    #         raise ValueError(f"Missing data keys: {missing_keys}")
+    #     new_data_length = len(data[self.data_keys[0]])
+    #     if not all(len(data[k]) == new_data_length for k in self.data_keys):
+    #         raise ValueError("All data items should have the same length")
+
+    #     next_index = self._data[OnlineBuffer.NEXT_INDEX_KEY][0]
+
+    #     # Sanity check to make sure that the new data indices start from 0.
+    #     assert data[OnlineBuffer.EPISODE_INDEX_KEY][0].item() == 0
+    #     assert data[OnlineBuffer.INDEX_KEY][0].item() == 0
+
+    #     # Shift the incoming indices if necessary.
+    #     if self.num_samples > 0:
+    #         last_episode_index = self._data[OnlineBuffer.EPISODE_INDEX_KEY][next_index - 1]
+    #         last_data_index = self._data[OnlineBuffer.INDEX_KEY][next_index - 1]
+    #         data[OnlineBuffer.EPISODE_INDEX_KEY] += last_episode_index + 1
+    #         data[OnlineBuffer.INDEX_KEY] += last_data_index + 1
+
+    #     # Insert the new data starting from next_index. It may be necessary to wrap around to the start.
+    #     n_surplus = max(0, new_data_length - (self._buffer_capacity - next_index))
+    #     for k in self.data_keys:
+    #         if n_surplus == 0:
+    #             slc = slice(next_index, next_index + new_data_length)
+    #             self._data[k][slc] = data[k]
+    #             self._data[OnlineBuffer.OCCUPANCY_MASK_KEY][slc] = True
+    #         else:
+    #             self._data[k][next_index:] = data[k][:-n_surplus]
+    #             self._data[OnlineBuffer.OCCUPANCY_MASK_KEY][next_index:] = True
+    #             self._data[k][:n_surplus] = data[k][-n_surplus:]
+    #     if n_surplus == 0:
+    #         self._data[OnlineBuffer.NEXT_INDEX_KEY][0] = next_index + new_data_length
+    #     else:
+    #         self._data[OnlineBuffer.NEXT_INDEX_KEY][0] = n_surplus
+
+    #     # Invalidate any episodes that don't start from their first frame. This can happen if the start of
+    #     # an episode was overwritten by incoming data.
+    #     pass
+
     def add_data(self, data: dict[str, np.ndarray]):
-        """Add new data to the buffer, which could potentially mean shifting old data out.
+        for episode_index in np.unique(data[OnlineBuffer.EPISODE_INDEX_KEY]):
+            where_episode = np.where(data[OnlineBuffer.EPISODE_INDEX_KEY] == episode_index)[0]
+            episode_data = {k: data[k][where_episode] for k in data}
+            self.add_episode(episode_data)
 
-        The new data should contain all the frames (in order) of any number of episodes. The indices should
-        start from 0 (note to the developer: this can easily be generalized). See the `rollout` and
-        `eval_policy` functions in `eval.py` for more information on how the data is constructed.
-
-        Shift the incoming data index and episode_index to continue on from the last frame. Note that this
-        will be done in place!
-        """
+    def add_episode(self, data: dict[str, np.ndarray]):
         if len(missing_keys := (set(self.data_keys).difference(set(data)))) > 0:
             raise ValueError(f"Missing data keys: {missing_keys}")
         new_data_length = len(data[self.data_keys[0]])
+        if new_data_length <= 0:
+            raise ValueError("The episode has 0 frames")
+        if new_data_length > self._buffer_capacity:
+            raise ValueError("The episode length is larger than the buffer capacity.")
         if not all(len(data[k]) == new_data_length for k in self.data_keys):
             raise ValueError("All data items should have the same length")
+        if not np.all(data[OnlineBuffer.EPISODE_INDEX_KEY] == data[OnlineBuffer.EPISODE_INDEX_KEY][0]):
+            raise ValueError(
+                "New data should only contain one episode but there is more than one unique episode index."
+            )
+        if not np.array_equal(data[OnlineBuffer.FRAME_INDEX_KEY], np.arange(new_data_length)):
+            raise ValueError(
+                "Expected frame indices to start from 0 and step up in increments of 1 per frame."
+            )
 
         next_index = self._data[OnlineBuffer.NEXT_INDEX_KEY][0]
-
-        # Sanity check to make sure that the new data indices start from 0.
-        assert data[OnlineBuffer.EPISODE_INDEX_KEY][0].item() == 0
-        assert data[OnlineBuffer.INDEX_KEY][0].item() == 0
-
-        # Shift the incoming indices if necessary.
         if self.num_samples > 0:
             last_episode_index = self._data[OnlineBuffer.EPISODE_INDEX_KEY][next_index - 1]
             last_data_index = self._data[OnlineBuffer.INDEX_KEY][next_index - 1]
-            data[OnlineBuffer.EPISODE_INDEX_KEY] += last_episode_index + 1
-            data[OnlineBuffer.INDEX_KEY] += last_data_index + 1
-
-        # Insert the new data starting from next_index. It may be necessary to wrap around to the start.
-        n_surplus = max(0, new_data_length - (self._buffer_capacity - next_index))
-        for k in self.data_keys:
-            if n_surplus == 0:
-                slc = slice(next_index, next_index + new_data_length)
-                self._data[k][slc] = data[k]
-                self._data[OnlineBuffer.OCCUPANCY_MASK_KEY][slc] = True
-            else:
-                self._data[k][next_index:] = data[k][:-n_surplus]
-                self._data[OnlineBuffer.OCCUPANCY_MASK_KEY][next_index:] = True
-                self._data[k][:n_surplus] = data[k][-n_surplus:]
-        if n_surplus == 0:
-            self._data[OnlineBuffer.NEXT_INDEX_KEY][0] = next_index + new_data_length
         else:
-            self._data[OnlineBuffer.NEXT_INDEX_KEY][0] = n_surplus
+            last_episode_index = -1
+            last_data_index = -1
+
+        # If there aren't enough slots in the buffer left to accommodate the episode, wrap to the start.
+        if max(0, new_data_length - (self._buffer_capacity - next_index)) > 0:
+            next_index = 0
+
+        # Insert the new data starting from next_index.
+        for k in self.data_keys:
+            slc = slice(next_index, next_index + new_data_length)
+            if k == OnlineBuffer.EPISODE_INDEX_KEY:
+                self._data[k][slc] = last_episode_index + 1
+            elif k == OnlineBuffer.INDEX_KEY:
+                self._data[k][slc] = np.arange(last_data_index + 1, last_data_index + 1 + new_data_length)
+            else:
+                self._data[k][slc] = data[k]
+            self._data[OnlineBuffer.OCCUPANCY_MASK_KEY][slc] = True
+
+        self._data[OnlineBuffer.NEXT_INDEX_KEY][0] = next_index + new_data_length
+
+        # # At this point, it's possible that the beginning of an existing episode was overwritten. Invalidate
+        # # the whole episode.
+        # for episode_index in np.unique(self._data[OnlineBuffer.EPISODE_INDEX_KEY]):
+        #     where_episode = np.where(self._data[OnlineBuffer.EPISODE_INDEX_KEY] == episode_index)[0]
+        #     if self._data[OnlineBuffer.FRAME_INDEX_KEY][where_episode[0]] != 0:
+        #         self._data[OnlineBuffer.OCCUPANCY_MASK_KEY][where_episode] = False
 
     @property
     def data_keys(self) -> list[str]:

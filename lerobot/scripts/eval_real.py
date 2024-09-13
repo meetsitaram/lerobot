@@ -26,6 +26,7 @@ from lerobot.common.rl import (
     calc_reward_cube_push,
     reset_for_cube_push,
 )
+from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
 from lerobot.common.robot_devices.robots.factory import make_robot
 from lerobot.common.robot_devices.robots.koch import KochRobot
 from lerobot.common.robot_devices.teleoperators.ps5_controller import PS5Controller
@@ -468,6 +469,13 @@ def eval_policy(
             "eval_ep_s": (time.perf_counter() - start_eval) / len(episodes_data),
         },
     }
+
+    # HACK: Bail on autonomous training
+    if eval_info["aggregated"]["pc_success"] == 0:
+        robot.follower_arms["main"].write("Torque_Enable", TorqueMode.DISABLED.value)
+        print("Exited after 0 success")
+        exit()
+
     return eval_info
 
 
