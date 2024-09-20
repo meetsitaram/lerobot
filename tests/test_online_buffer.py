@@ -14,18 +14,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.d
 from copy import deepcopy
+from pathlib import Path
 from uuid import uuid4
 
+import datasets
 import numpy as np
 import pytest
 import torch
-from datasets import Dataset
 
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.datasets.online_buffer import OnlineBuffer, compute_sampler_weights
-from lerobot.common.datasets.utils import hf_transform_to_torch
+from lerobot.common.datasets.lerobot_dataset import CODEBASE_VERSION, DATA_DIR, LeRobotDataset
+from lerobot.common.datasets.online_buffer import (
+    DataBuffer,
+    TimestampOutsideToleranceError,
+    compute_sampler_weights,
+)
+from lerobot.common.datasets.utils import hf_transform_to_torch, load_hf_dataset, load_info, load_videos
+from lerobot.common.datasets.video_utils import VideoFrame, decode_video_frames_torchvision
+from tests.utils import DevTestingError
 
-# Some constants for OnlineBuffer tests.
+# Some constants for DataBuffer tests.
 data_key = "data"
 data_shape = (2, 3)  # just some arbitrary > 1D shape
 buffer_capacity = 100
@@ -33,32 +40,29 @@ fps = 10
 
 
 def make_new_buffer(
-    write_dir: str | None = None, delta_timestamps: dict[str, list[float]] | None = None
-) -> tuple[OnlineBuffer, str]:
-    if write_dir is None:
-        write_dir = f"/tmp/online_buffer_{uuid4().hex}"
-    buffer = OnlineBuffer(
-        write_dir,
-        data_spec={data_key: {"shape": data_shape, "dtype": np.dtype("float32")}},
-        buffer_capacity=buffer_capacity,
-        fps=fps,
+    storage_dir: str, storage_dir_exists: bool = False, delta_timestamps: dict[str, list[float]] | None = None
+) -> DataBuffer:
+    buffer = DataBuffer(
+        storage_dir,
+        buffer_capacity=buffer_capacity if not storage_dir_exists else None,
+        fps=None if delta_timestamps is None else fps,
         delta_timestamps=delta_timestamps,
     )
-    return buffer, write_dir
+    return buffer
 
 
 def make_spoof_data_frames(n_episodes: int, n_frames_per_episode: int) -> dict[str, np.ndarray]:
     new_data = {
         data_key: np.arange(n_frames_per_episode * n_episodes * np.prod(data_shape)).reshape(-1, *data_shape),
-        OnlineBuffer.INDEX_KEY: np.arange(n_frames_per_episode * n_episodes),
-        OnlineBuffer.EPISODE_INDEX_KEY: np.repeat(np.arange(n_episodes), n_frames_per_episode),
-        OnlineBuffer.FRAME_INDEX_KEY: np.tile(np.arange(n_frames_per_episode), n_episodes),
-        OnlineBuffer.TIMESTAMP_KEY: np.tile(np.arange(n_frames_per_episode) / fps, n_episodes),
+        DataBuffer.INDEX_KEY: np.arange(n_frames_per_episode * n_episodes),
+        DataBuffer.EPISODE_INDEX_KEY: np.repeat(np.arange(n_episodes), n_frames_per_episode),
+        DataBuffer.FRAME_INDEX_KEY: np.tile(np.arange(n_frames_per_episode), n_episodes),
+        DataBuffer.TIMESTAMP_KEY: np.tile(np.arange(n_frames_per_episode) / fps, n_episodes),
     }
     return new_data
 
 
-def test_non_mutate():
+def test_non_mutate(tmp_path: Path):
     """Checks that the data provided to the add_data method is copied rather than passed by reference.
 
     This means that mutating the data in the buffer does not mutate the original data.
@@ -66,25 +70,27 @@ def test_non_mutate():
     NOTE: If this test fails, it means some of the other tests may be compromised. For example, we can't trust
     a success case for `test_write_read`.
     """
-    buffer, _ = make_new_buffer()
+    buffer = make_new_buffer(tmp_path / f"buffer_{uuid4().hex}")
+    # Note: choices for args to make_spoof_data_frames are arbitrary.
     new_data = make_spoof_data_frames(2, buffer_capacity // 4)
     new_data_copy = deepcopy(new_data)
-    buffer.add_data(new_data)
-    buffer._data[data_key][:] += 1
+    buffer.add_episodes(new_data)
+    buffer.get_data_by_key(data_key)[:] += 1
     assert all(np.array_equal(new_data[k], new_data_copy[k]) for k in new_data)
 
 
-def test_index_error_no_data():
-    buffer, _ = make_new_buffer()
+def test_index_error_no_data(tmp_path: Path):
+    buffer = make_new_buffer(tmp_path / f"buffer_{uuid4().hex}")
     with pytest.raises(IndexError):
         buffer[0]
 
 
-def test_index_error_with_data():
-    buffer, _ = make_new_buffer()
+def test_index_error_with_data(tmp_path: Path):
+    buffer = make_new_buffer(tmp_path / f"buffer_{uuid4().hex}")
     n_frames = buffer_capacity // 2
+    # Note: choices for args to make_spoof_data_frames are arbitrary.
     new_data = make_spoof_data_frames(1, n_frames)
-    buffer.add_data(new_data)
+    buffer.add_episodes(new_data)
     with pytest.raises(IndexError):
         buffer[n_frames]
     with pytest.raises(IndexError):
@@ -92,20 +98,22 @@ def test_index_error_with_data():
 
 
 @pytest.mark.parametrize("do_reload", [False, True])
-def test_write_read(do_reload: bool):
+def test_write_read(tmp_path: Path, do_reload: bool):
     """Checks that data can be added to the buffer and read back.
 
     If do_reload we delete the buffer object and load the buffer back from disk before reading.
     """
-    buffer, write_dir = make_new_buffer()
+    storage_dir = tmp_path / f"buffer_{uuid4().hex}"
+    buffer = make_new_buffer(storage_dir)
+    # Note: choices for args to make_spoof_data_frames are arbitrary.
     n_episodes = 2
     n_frames_per_episode = buffer_capacity // 4
     new_data = make_spoof_data_frames(n_episodes, n_frames_per_episode)
-    buffer.add_data(new_data)
+    buffer.add_episodes(new_data)
 
     if do_reload:
         del buffer
-        buffer, _ = make_new_buffer(write_dir)
+        buffer = make_new_buffer(storage_dir, storage_dir_exists=True)
 
     assert len(buffer) == n_frames_per_episode * n_episodes
     for i, item in enumerate(buffer):
@@ -113,102 +121,271 @@ def test_write_read(do_reload: bool):
         assert np.array_equal(item[data_key].numpy(), new_data[data_key][i])
 
 
-def test_read_data_key():
-    """Tests that data can be added to a buffer and all data for a. specific key can be read back."""
-    buffer, _ = make_new_buffer()
-    n_episodes = 2
-    n_frames_per_episode = buffer_capacity // 4
-    new_data = make_spoof_data_frames(n_episodes, n_frames_per_episode)
-    buffer.add_data(new_data)
-
-    data_from_buffer = buffer.get_data_by_key(data_key)
-    assert isinstance(data_from_buffer, torch.Tensor)
-    assert np.array_equal(data_from_buffer.numpy(), new_data[data_key])
-
-
-def test_fifo():
+def test_fifo(tmp_path: Path):
     """Checks that if data is added beyond the buffer capacity, we discard the oldest data first."""
-    buffer, _ = make_new_buffer()
-    n_frames_per_episode = buffer_capacity // 4
+    buffer = make_new_buffer(tmp_path / f"buffer_{uuid4().hex}")
+    # Note: choices for args to make_spoof_data_frames are mostly arbitrary. Of interest is:
+    #   - later we need `n_more_episodes` to cause an overflow.
+    #   - we need that overflow to happen *within* an episode such that we're testing the behavior whereby the
+    #     whole episode is wrapped to the start of the buffer, even if part of it can fit.
+    n_frames_per_episode = buffer_capacity // 4 + 2
     n_episodes = 3
-    new_data = make_spoof_data_frames(n_episodes, n_frames_per_episode)
-    buffer.add_data(new_data)
+    if buffer_capacity - n_frames_per_episode * n_episodes >= n_frames_per_episode:
+        raise DevTestingError("Make sure to set this up such that adding another episode causes an overflow.")
+    new_episodes = make_spoof_data_frames(n_episodes, n_frames_per_episode)
+    buffer.add_episodes(new_episodes)
+    # Note `n_more_episodes` is chosen to result in an overflow on the first episode.
     n_more_episodes = 2
-    # Developer sanity check (in case someone changes the global `buffer_capacity`).
+    # Make this slightly larger than the prior episodes to test that there is no issue with overwriting the
+    # start of an existing episode.
+    n_frames_per_more_episodes = n_frames_per_episode + 1
+    more_new_episodes = make_spoof_data_frames(n_more_episodes, n_frames_per_more_episodes)
+    buffer.add_episodes(more_new_episodes)
     assert (
-        n_episodes + n_more_episodes
-    ) * n_frames_per_episode > buffer_capacity, "Something went wrong with the test code."
-    more_new_data = make_spoof_data_frames(n_more_episodes, n_frames_per_episode)
-    buffer.add_data(more_new_data)
-    assert len(buffer) == buffer_capacity, "The buffer should be full."
+        len(buffer) == n_frames_per_episode * n_episodes
+    ), "The new episode should have wrapped around to the start"
 
     expected_data = {}
-    for k in new_data:
-        # Concatenate, left-truncate, then roll, to imitate the cyclical FIFO pattern in OnlineBuffer.
-        expected_data[k] = np.roll(
-            np.concatenate([new_data[k], more_new_data[k]])[-buffer_capacity:],
-            shift=len(new_data[k]) + len(more_new_data[k]) - buffer_capacity,
-            axis=0,
-        )
+    for k in new_episodes:
+        expected_data[k] = new_episodes[k]
+        # The extra new episode should overwrite the start of the buffer.
+        expected_data[k][: len(more_new_episodes[k])] = more_new_episodes[k]
 
     for i, item in enumerate(buffer):
-        assert all(isinstance(item[k], torch.Tensor) for k in item)
         assert np.array_equal(item[data_key].numpy(), expected_data[data_key][i])
 
 
-def test_delta_timestamps_within_tolerance():
-    """Check that getting an item with delta_timestamps within tolerance succeeds.
+def test_get_data_by_key(tmp_path: Path):
+    """Tests that data can be added to a buffer and all data for a specific key can be read back."""
+    buffer = make_new_buffer(tmp_path / f"buffer_{uuid4().hex}")
+    # Note: choices for args to make_spoof_data_frames are mostly arbitrary. The only intentional aspect is to
+    # make sure the buffer is not full, in order to check that `get_data_by_key` only returns the part of the
+    # buffer that is occupied.
+    n_episodes = 2
+    n_frames_per_episode = buffer_capacity // 4
+    new_episodes = make_spoof_data_frames(n_episodes, n_frames_per_episode)
+    buffer.add_episodes(new_episodes)
 
-    Note: Copied from `test_datasets.py::test_load_previous_and_future_frames_within_tolerance`.
-    """
-    # Sanity check on global fps as we are assuming it is 10 here.
-    assert fps == 10, "This test assumes fps==10"
-    buffer, _ = make_new_buffer(delta_timestamps={"index": [-0.2, 0, 0.139]})
+    data_from_buffer = buffer.get_data_by_key(data_key)
+    assert np.array_equal(data_from_buffer, new_episodes[data_key])
+
+
+def test_delta_timestamps_within_tolerance(tmp_path: Path):
+    """Check that getting an item with delta_timestamps within tolerance succeeds."""
+    if fps != 10:
+        raise DevTestingError("This test is designed to use fps == 10.")
+    buffer = make_new_buffer(tmp_path / f"buffer_{uuid4().hex}", delta_timestamps={"index": [-0.2, 0, 0.1]})
     new_data = make_spoof_data_frames(n_episodes=1, n_frames_per_episode=5)
-    buffer.add_data(new_data)
-    buffer.tolerance_s = 0.04
+    buffer.add_episodes(new_data)
     item = buffer[2]
-    data, is_pad = item["index"], item[f"index{OnlineBuffer.IS_PAD_POSTFIX}"]
+    data, is_pad = item["index"], item[f"index{DataBuffer.IS_PAD_POSTFIX}"]
     assert torch.allclose(data, torch.tensor([0, 2, 3])), "Data does not match expected values"
     assert not is_pad.any(), "Unexpected padding detected"
 
 
-def test_delta_timestamps_outside_tolerance_inside_episode_range():
+def test_delta_timestamps_outside_tolerance_inside_episode_range(tmp_path: Path):
     """Check that getting an item with delta_timestamps outside of tolerance fails.
 
     We expect it to fail if and only if the requested timestamps are within the episode range.
-
-    Note: Copied from
-    `test_datasets.py::test_load_previous_and_future_frames_outside_tolerance_inside_episode_range`
     """
-    # Sanity check on global fps as we are assuming it is 10 here.
-    assert fps == 10, "This test assumes fps==10"
-    buffer, _ = make_new_buffer(delta_timestamps={"index": [-0.2, 0, 0.141]})
+    if fps != 10:
+        raise DevTestingError("This test is designed to use fps == 10.")
+    buffer = make_new_buffer(tmp_path / f"buffer_{uuid4().hex}", delta_timestamps={"index": [-0.2, 0, 0.1]})
     new_data = make_spoof_data_frames(n_episodes=1, n_frames_per_episode=5)
-    buffer.add_data(new_data)
-    buffer.tolerance_s = 0.04
-    with pytest.raises(AssertionError):
+    # Hack the timestamps to invoke a tolerance error.
+    new_data["timestamp"][3] += 0.1
+    buffer.add_episodes(new_data)
+    with pytest.raises(TimestampOutsideToleranceError):
         buffer[2]
 
 
-def test_delta_timestamps_outside_tolerance_outside_episode_range():
-    """Check that copy-padding of timestamps outside of the episode range works.
-
-    Note: Copied from
-    `test_datasets.py::test_load_previous_and_future_frames_outside_tolerance_outside_episode_range`
-    """
-    # Sanity check on global fps as we are assuming it is 10 here.
-    assert fps == 10, "This test assumes fps==10"
-    buffer, _ = make_new_buffer(delta_timestamps={"index": [-0.3, -0.24, 0, 0.26, 0.3]})
+def test_delta_timestamps_outside_tolerance_outside_episode_range(tmp_path):
+    """Check that copy-padding of timestamps outside of the episode range works."""
+    if fps != 10:
+        raise DevTestingError("This test is designed to use fps == 10.")
+    buffer = make_new_buffer(
+        tmp_path / f"buffer_{uuid4().hex}", delta_timestamps={"index": [-0.3, -0.2, 0, 0.2, 0.3]}
+    )
     new_data = make_spoof_data_frames(n_episodes=1, n_frames_per_episode=5)
-    buffer.add_data(new_data)
-    buffer.tolerance_s = 0.04
+    buffer.add_episodes(new_data)
     item = buffer[2]
     data, is_pad = item["index"], item["index_is_pad"]
     assert torch.equal(data, torch.tensor([0, 0, 2, 4, 4])), "Data does not match expected values"
     assert torch.equal(
-        is_pad, torch.tensor([True, False, False, True, True])
+        is_pad, torch.tensor([True, False, False, False, True])
     ), "Padding does not match expected values"
+
+
+@pytest.mark.parametrize(
+    ("dataset_repo_id", "decode_video"),
+    (
+        # choose unitreeh1_two_robot_greeting to have multiple image keys (with minimal video data)
+        ("lerobot/unitreeh1_two_robot_greeting", True),
+        ("lerobot/unitreeh1_two_robot_greeting", False),
+        ("lerobot/pusht", False),
+    ),
+)
+def test_camera_keys(tmp_path: Path, dataset_repo_id: str, decode_video: bool):
+    """Check that the camera_keys property returns all relevant keys."""
+    storage_dir = tmp_path / f"{dataset_repo_id}_{uuid4().hex}_{decode_video}"
+    buffer = DataBuffer.from_huggingface_hub(dataset_repo_id, decode_video, storage_dir=storage_dir)
+    assert set(buffer.camera_keys) == {k for k in buffer._data if k.startswith("observation.image")}
+
+
+@pytest.mark.parametrize(
+    ("dataset_repo_id", "decode_video"),
+    (
+        # choose unitreeh1_two_robot_greeting to have multiple image keys
+        ("lerobot/unitreeh1_two_robot_greeting", True),
+        ("lerobot/unitreeh1_two_robot_greeting", False),
+        ("lerobot/pusht", False),
+    ),
+)
+def test_getter_returns_pytorch_format(tmp_path: Path, dataset_repo_id: str, decode_video: bool):
+    """Checks that tensors are returned and that images are torch.float32, in range [0, 1], channel-first."""
+    # Note: storage_dir specified explicitly in order to make use of pytest's temporary file fixture.
+    storage_dir = tmp_path / f"{dataset_repo_id}_{uuid4().hex}_{decode_video}"
+    buffer = DataBuffer.from_huggingface_hub(dataset_repo_id, decode_video, storage_dir=storage_dir)
+    # Just iterate through the start and end of the dataset to make the test faster.
+    for i in np.concatenate([np.arange(0, 10), np.arange(-10, 0)]):
+        item = buffer[i]
+        for k in item:
+            assert isinstance(item[k], torch.Tensor)
+        for k in buffer.camera_keys:
+            assert item[k].dtype == torch.float32, "images aren't float32"
+            assert item[k].max() <= 1, "image values go above max of range [0, 1]"
+            assert item[k].min() >= 0, "image values go below min of range [0, 1]"
+            c, h, w = item[k].shape
+            assert c < min(h, w), "images are not channel-first"
+
+
+def test_getter_images_with_delta_timestamps(tmp_path: Path):
+    """Checks a basic delta_timestamps use case with images.
+
+    Specifically, makes sure that the items returned by the getter have the correct number of frames.
+
+    Note: images deserve particular attention because they are not covered by the basic tests above that use
+    simple spoof data.
+    """
+    dataset_repo_id = "lerobot/pusht_image"
+    lerobot_dataset_info = load_info(dataset_repo_id, version=CODEBASE_VERSION, root=DATA_DIR)
+    fps = lerobot_dataset_info["fps"]
+    # Note: storage_dir specified explicitly in order to make use of pytest's temporary file fixture.
+    storage_dir = tmp_path / f"{dataset_repo_id}_{uuid4().hex}"
+    buffer = DataBuffer.from_huggingface_hub(dataset_repo_id, storage_dir=storage_dir, fps=fps)
+    delta_timestamps = [-1 / fps, 0.0, 1 / fps]
+    buffer.set_delta_timestamps({k: delta_timestamps for k in buffer.camera_keys})
+
+    # Just iterate through the start and end of the dataset to make the test faster.
+    for i in np.concatenate([np.arange(0, 10), np.arange(-10, 0)]):
+        item = buffer[i]
+        for k in buffer.camera_keys:
+            assert item[k].shape[0] == len(delta_timestamps)
+
+
+def test_getter_video_images_with_delta_timestamps(tmp_path: Path):
+    """Checks that images from the video dataset and decoded video dataset are the same.
+
+    Adds to `test_getter_images_with_delta_timestamps` by testing with a video dataset.
+
+    Note: images deserve particular attention because video decoding is involved, and because they are not
+    covered by the basic tests above that use simple spoof data.
+    """
+    # choose unitreeh1_two_robot_greeting to have multiple image keys
+    dataset_repo_id = "lerobot/unitreeh1_two_robot_greeting"
+    lerobot_dataset_info = load_info(dataset_repo_id, version=CODEBASE_VERSION, root=DATA_DIR)
+    fps = lerobot_dataset_info["fps"]
+    # Note: storage_dir specified explicitly in order to make use of pytest's temporary file fixture.
+    buffer_video = DataBuffer.from_huggingface_hub(
+        dataset_repo_id, False, storage_dir=tmp_path / f"{dataset_repo_id}_{uuid4().hex}_False", fps=fps
+    )
+    buffer_decode = DataBuffer.from_huggingface_hub(
+        dataset_repo_id, True, storage_dir=tmp_path / f"{dataset_repo_id}_{uuid4().hex}_True", fps=fps
+    )
+
+    assert set(buffer_video.camera_keys) == set(buffer_decode.camera_keys)
+
+    delta_timestamps = [-1 / fps, 0.0, 1 / fps]
+    buffer_video.set_delta_timestamps({k: delta_timestamps for k in buffer_video.camera_keys})
+    buffer_decode.set_delta_timestamps({k: delta_timestamps for k in buffer_decode.camera_keys})
+
+    # Just iterate through the start and end of the datasets to make the test faster.
+    for i in np.concatenate([np.arange(0, 10), np.arange(-10, 0)]):
+        item_video = buffer_video[i]
+        item_decode = buffer_decode[i]
+        for k in buffer_video.camera_keys:
+            assert item_video[k].shape[0] == len(delta_timestamps)
+            assert item_decode[k].shape[0] == len(delta_timestamps)
+            assert torch.equal(item_video[k], item_decode[k])
+
+
+@pytest.mark.parametrize(
+    ("dataset_repo_id", "decode_video"),
+    (
+        ("lerobot/pusht", True),
+        ("lerobot/pusht", False),
+        ("lerobot/pusht_image", False),
+    ),
+)
+def test_from_huggingface_hub(tmp_path: Path, dataset_repo_id: str, decode_video: bool):
+    """
+    Check that:
+        - We can make a buffer from a Hugging Face Hub dataset repository.
+        - The buffer we make, accurately reflects the hub dataset.
+        - We can get an item from the buffer.
+        - If we try to make it a second time, everything still works as expected.
+    """
+    for iteration in range(2):  # do it twice to check that running with an existing cached buffer also works
+        hf_dataset = load_hf_dataset(dataset_repo_id, version=CODEBASE_VERSION, root=DATA_DIR, split="train")
+        hf_dataset.set_transform(lambda x: x)
+        # Note: storage_dir specified explicitly in order to make use of pytest's temporary file fixture.
+        # This ensures that the first time this loop is run, the storage directory does not already exist.
+        storage_dir = tmp_path / DataBuffer._default_storage_dir_from_huggingface_hub(
+            dataset_repo_id, hf_dataset._fingerprint, decode_video
+        ).relative_to("/tmp")
+        if iteration == 0 and storage_dir.exists():
+            raise DevTestingError("The storage directory should not exist for the first pass of this test.")
+        buffer = DataBuffer.from_huggingface_hub(
+            dataset_repo_id,
+            decode_video,
+            storage_dir=storage_dir,
+        )
+        assert len(buffer) == len(hf_dataset)
+        for k, feature in hf_dataset.features.items():
+            if isinstance(feature, datasets.features.Image):
+                assert np.array_equal(
+                    buffer.get_data_by_key(k), np.stack([np.array(pil_img) for pil_img in hf_dataset[k]])
+                )
+            elif isinstance(feature, VideoFrame):
+                if decode_video:
+                    # Decode the video here.
+                    lerobot_dataset_info = load_info(dataset_repo_id, version=CODEBASE_VERSION, root=DATA_DIR)
+                    videos_path = load_videos(dataset_repo_id, version=CODEBASE_VERSION, root=DATA_DIR)
+                    episode_indices = np.array(hf_dataset["episode_index"])
+                    timestamps = np.array(hf_dataset["timestamp"])
+                    all_imgs = []
+                    for episode_index in np.unique(episode_indices):
+                        episode_data_indices = np.where(episode_indices == episode_index)[0]
+                        episode_timestamps = timestamps[episode_indices == episode_index]
+                        episode_imgs = decode_video_frames_torchvision(
+                            videos_path.parent / hf_dataset[k][episode_data_indices[0]]["path"],
+                            episode_timestamps,
+                            1 / lerobot_dataset_info["fps"] - 1e-4,
+                            to_pytorch_format=False,
+                        )
+                        all_imgs.extend(episode_imgs)
+                    assert np.array_equal(buffer.get_data_by_key(k), all_imgs)
+                else:
+                    # Check that the video paths are the same.
+                    assert np.array_equal(
+                        buffer.get_data_by_key(k), [item["path"].encode("ascii") for item in hf_dataset[k]]
+                    )
+            elif isinstance(feature, (datasets.features.Sequence, datasets.features.Value)):
+                assert np.array_equal(buffer.get_data_by_key(k), hf_dataset[k])
+            else:
+                raise DevTestingError(f"Tests not implemented for this feature type: {type(feature)=}.")
+        # Check that we can get an item.
+        _ = buffer[0]
 
 
 # Arbitrarily set small dataset sizes, making sure to have uneven sizes.
@@ -216,14 +393,14 @@ def test_delta_timestamps_outside_tolerance_outside_episode_range():
 @pytest.mark.parametrize("online_dataset_size", [0, 4])
 @pytest.mark.parametrize("online_sampling_ratio", [0.0, 1.0])
 def test_compute_sampler_weights_trivial(
-    offline_dataset_size: int, online_dataset_size: int, online_sampling_ratio: float
+    tmp_path: Path, offline_dataset_size: int, online_dataset_size: int, online_sampling_ratio: float
 ):
     # Pass/skip the test if both datasets sizes are zero.
     if offline_dataset_size + online_dataset_size == 0:
         return
     # Create spoof offline dataset.
     offline_dataset = LeRobotDataset.from_preloaded(
-        hf_dataset=Dataset.from_dict({"data": list(range(offline_dataset_size))})
+        hf_dataset=datasets.Dataset.from_dict({"data": list(range(offline_dataset_size))})
     )
     offline_dataset.hf_dataset.set_transform(hf_transform_to_torch)
     if offline_dataset_size == 0:
@@ -235,9 +412,9 @@ def test_compute_sampler_weights_trivial(
             "to": torch.tensor([offline_dataset_size // 2, offline_dataset_size]),
         }
     # Create spoof online datset.
-    online_dataset, _ = make_new_buffer()
+    online_dataset = make_new_buffer(tmp_path / f"buffer_{uuid4().hex}")
     if online_dataset_size > 0:
-        online_dataset.add_data(
+        online_dataset.add_episodes(
             make_spoof_data_frames(n_episodes=2, n_frames_per_episode=online_dataset_size // 2)
         )
 
@@ -254,18 +431,20 @@ def test_compute_sampler_weights_trivial(
     assert torch.allclose(weights, expected_weights)
 
 
-def test_compute_sampler_weights_nontrivial_ratio():
+def test_compute_sampler_weights_nontrivial_ratio(tmp_path: Path):
     # Arbitrarily set small dataset sizes, making sure to have uneven sizes.
     # Create spoof offline dataset.
-    offline_dataset = LeRobotDataset.from_preloaded(hf_dataset=Dataset.from_dict({"data": list(range(4))}))
+    offline_dataset = LeRobotDataset.from_preloaded(
+        hf_dataset=datasets.Dataset.from_dict({"data": list(range(4))})
+    )
     offline_dataset.hf_dataset.set_transform(hf_transform_to_torch)
     offline_dataset.episode_data_index = {
         "from": torch.tensor([0, 2]),
         "to": torch.tensor([2, 4]),
     }
     # Create spoof online datset.
-    online_dataset, _ = make_new_buffer()
-    online_dataset.add_data(make_spoof_data_frames(n_episodes=4, n_frames_per_episode=2))
+    online_dataset = make_new_buffer(tmp_path / f"buffer_{uuid4().hex}")
+    online_dataset.add_episodes(make_spoof_data_frames(n_episodes=4, n_frames_per_episode=2))
     online_sampling_ratio = 0.8
     weights = compute_sampler_weights(
         offline_dataset, online_dataset=online_dataset, online_sampling_ratio=online_sampling_ratio
@@ -275,40 +454,20 @@ def test_compute_sampler_weights_nontrivial_ratio():
     )
 
 
-def test_compute_sampler_weights_nontrivial_ratio_and_drop_last_n():
-    # Arbitrarily set small dataset sizes, making sure to have uneven sizes.
-    # Create spoof offline dataset.
-    offline_dataset = LeRobotDataset.from_preloaded(hf_dataset=Dataset.from_dict({"data": list(range(4))}))
-    offline_dataset.hf_dataset.set_transform(hf_transform_to_torch)
-    offline_dataset.episode_data_index = {
-        "from": torch.tensor([0]),
-        "to": torch.tensor([4]),
-    }
-    # Create spoof online datset.
-    online_dataset, _ = make_new_buffer()
-    online_dataset.add_data(make_spoof_data_frames(n_episodes=4, n_frames_per_episode=2))
-    weights = compute_sampler_weights(
-        offline_dataset, online_dataset=online_dataset, online_sampling_ratio=0.8, online_drop_n_last_frames=1
-    )
-    assert torch.allclose(
-        weights, torch.tensor([0.05, 0.05, 0.05, 0.05, 0.2, 0.0, 0.2, 0.0, 0.2, 0.0, 0.2, 0.0])
-    )
-
-
-def test_compute_sampler_weights_drop_n_last_frames():
-    """Note: test copied from test_sampler."""
+def test_compute_sampler_weights_drop_n_last_frames(tmp_path: Path):
+    """Check that the drop_n_last_frames feature works as intended."""
     data_dict = {
         "timestamp": [0, 0.1],
         "index": [0, 1],
         "episode_index": [0, 0],
         "frame_index": [0, 1],
     }
-    offline_dataset = LeRobotDataset.from_preloaded(hf_dataset=Dataset.from_dict(data_dict))
+    offline_dataset = LeRobotDataset.from_preloaded(hf_dataset=datasets.Dataset.from_dict(data_dict))
     offline_dataset.hf_dataset.set_transform(hf_transform_to_torch)
     offline_dataset.episode_data_index = {"from": torch.tensor([0]), "to": torch.tensor([2])}
 
-    online_dataset, _ = make_new_buffer()
-    online_dataset.add_data(make_spoof_data_frames(n_episodes=4, n_frames_per_episode=2))
+    online_dataset = make_new_buffer(tmp_path / f"buffer_{uuid4().hex}")
+    online_dataset.add_episodes(make_spoof_data_frames(n_episodes=4, n_frames_per_episode=2))
 
     weights = compute_sampler_weights(
         offline_dataset,

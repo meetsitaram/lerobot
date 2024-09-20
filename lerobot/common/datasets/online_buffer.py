@@ -13,24 +13,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""An online buffer for the online training loop in train.py
+"""A data buffer for efficient data management during offline and online training."""
 
-Note to maintainers: This duplicates some logic from LeRobotDataset and EpisodeAwareSampler. We should
-consider converging to one approach. Here we have opted to use numpy.memmap to back the data buffer. It's much
-faster than using HuggingFace Datasets as there's no conversion to an intermediate non-python object. Also it
-supports in-place slicing and mutation which is very handy for a dynamic buffer.
-"""
-
-import logging
+import json
 import os
-from itertools import chain
+import shutil
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
+import datasets
+import einops
 import numpy as np
 import torch
+from tqdm import tqdm
 
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.common.datasets.lerobot_dataset import CODEBASE_VERSION, DATA_DIR, LeRobotDataset
+from lerobot.common.datasets.utils import load_hf_dataset, load_info, load_videos
+from lerobot.common.datasets.video_utils import VideoFrame, decode_video_frames_torchvision
+from lerobot.common.utils.utils import inside_slurm
+
+# TODO(alexander-soare): Move somewhere more appropriate once the DataBuffer class permeates more of the coe
+# base.
+MAX_VIDEO_PATH_LENGTH = 100
 
 
 def _make_memmap_safe(**kwargs) -> np.memmap:
@@ -47,183 +51,292 @@ def _make_memmap_safe(**kwargs) -> np.memmap:
         available_space = stats.f_bavail * stats.f_frsize  # bytes
         if required_space >= available_space * 0.8:
             raise RuntimeError(
-                f"You're about to take up {required_space} of {available_space} bytes available."
+                f"You're about to take up {required_space} of {available_space} bytes available. This "
+                "exception has been raised to protect your storage device."
+                ""
             )
     return np.memmap(**kwargs)
 
 
-class OnlineBuffer(torch.utils.data.Dataset):
-    """FIFO data buffer for the online training loop in train.py.
+class TimestampOutsideToleranceError(Exception):
+    pass
 
-    Follows the protocol of LeRobotDataset as much as is required to have it be used by the online training
-    loop in the same way that a LeRobotDataset would be used.
 
-    The underlying data structure will have data inserted in a circular fashion. Always insert after the
-    last index, and when you reach the end, wrap around to the start.
+class DataBuffer(torch.utils.data.Dataset):
+    """Data buffer and training data item getter.
 
-    The data is stored in a numpy memmap.
+    Data is considered to come in the form of "episodes" (an instance of a robot performing a task). Episodes
+    are made up of "frames", which are chronoligically ordered and contain timestamp aligned data, potentially
+    including environment observations, and robot actions. NOTE: for the time being, we require all data
+    modalities to be timestamp aligned. This constraint may be relaxed in the future.
+
+    The data is stored in a mapping from data keys to arrays with shape (total_number_of_frames, *data_dim).
+    The compulsory data keys are:
+        - "index": A sequential integer index per frame.
+        - "episode_index": A sequential integer index per episode.
+        - "frame_index": A sequential integer index per frame within an episode (it resets for each episode).
+        - "timestamp": The relative timestamp of the frame within the episode in units of seconds. The choice.
+            of reference time is not important.
+
+    Under the hood, the data is stored in `numpy.memmap`s, one for each data key. Loosely speaking, memory
+    mapping (https://en.wikipedia.org/wiki/Memory-mapped_file) allows us to treat a portion of disk space as
+    virtual memory. This allows us to work with more data than can fit in our physical memory, while treating
+    the data as if it were just standard numpy arrays. The associated files are saved in the file system under
+    what we call the "storage directory", and the Python object that allows us to treat them as virtual memory
+    is called the "buffer". The storage directory also contains a "meta.json" file which includes information
+    about the date types and shapes for each memmap. This allows us to load the data without having to specify
+    the data specifications at runtime.
+
+    The `add_episodes` method can be used to insert more data in the form of integral episodes (starting from
+    frame 0 and with the frames ordered). The buffer has a compulsory size limit, which must be provided when
+    creating a new one. Data is inserted in a circular fashion, inserting after the most recently added frame,
+    and wrapping around to the start when necessary (in which case older episodes are overwritten).
+
+    This class is also a PyTorch Dataset and can be used as such in a dataloader for a training loop. The item
+    getter returns either a single frame, or a slice of a single episode if `delta_timestamps` is set. It also
+    converts the numpy data to torch tensors, and handles converting images to channel-first, float32
+    normalized to the range [0, 1].
     """
 
+    # Special key for a (1,) array storing a pointer to the next index to fill from when adding data.
     NEXT_INDEX_KEY = "_next_index"
+    # Since the data buffer is pre-allocated, this boolean mask is used to indicate which frames have "real"
+    # data.
     OCCUPANCY_MASK_KEY = "_occupancy_mask"
+    # This is not a data key used in the buffer. It is used to indicate that a frame is padding, added by the
+    # __getitem__ method.
+    IS_PAD_POSTFIX = "_is_pad"
     INDEX_KEY = "index"
     FRAME_INDEX_KEY = "frame_index"
     EPISODE_INDEX_KEY = "episode_index"
     TIMESTAMP_KEY = "timestamp"
-    IS_PAD_POSTFIX = "_is_pad"
+    PRESET_KEYS = {INDEX_KEY, FRAME_INDEX_KEY, EPISODE_INDEX_KEY, TIMESTAMP_KEY}
+    # By convention, all images should be stored under a key with this prefix.
+    IMAGE_KEY_PREFIX = "observation.image"
+
+    METADATA_FILE_NAME = "meta.json"
 
     def __init__(
         self,
-        write_dir: str | Path,
-        data_spec: dict[str, Any] | None,
-        buffer_capacity: int | None,
-        fps: float | None = None,
-        image_transforms: Callable | None = None,
+        storage_dir: str | Path,
+        buffer_capacity: int | None = None,
+        image_transform: Callable[[np.ndarray], np.ndarray] | None = None,
         delta_timestamps: dict[str, list[float]] | dict[str, np.ndarray] | None = None,
+        fps: float | None = None,
     ):
         """
-        The online buffer can be provided from scratch or you can load an existing online buffer by passing
-        a `write_dir` associated with an existing buffer.
-
         Args:
-            write_dir: Where to keep the numpy memmap files. One memmap file will be stored for each data key.
-                Note that if the files already exist, they are opened in read-write mode (used for training
-                resumption.)
-            data_spec: A mapping from data key to data specification, like {data_key: {"shape": tuple[int],
-                "dtype": np.dtype}}. This should include all the data that you wish to record into the buffer,
-                but note that "index", "frame_index" and "episode_index" are already accounted for by this
-                class, so you don't need to include them.
+            storage_dir: Where to keep the numpy memmap files and metadata files. One memmap file will be
+                stored for each data key. Note that if the storage directory already exist, the memmap files
+                are opened in read-write mode. If the storage directory does not exist, it will be lazily
+                created with the first call to `add_episodes`.
             buffer_capacity: How many frames should be stored in the buffer as a maximum. Be aware of your
-                system's available disk space when choosing this.
-            fps: Same as the fps concept in LeRobot dataset. Here it needs to be provided for the
-                 delta_timestamps logic. You can pass None if you are not using delta_timestamps.
-            delta_timestamps: Same as the delta_timestamps concept in LeRobotDataset. This is internally
-                converted to dict[str, np.ndarray] for optimization purposes.
+                system's available disk space when choosing this. Note that if `storage_dir` references an
+                existing storage directory, `buffer_capacity` should not be provided, as it is already
+                included in "meta.json".
+            image_transform: Transforms to apply in the item getter to all image data (any data whose key
+                starts with "observation.image").
+            delta_timestamps: TODO(alexander-soare): Document this somewhere when
+                `load_previous_and_future_frames` is refactored.
+            fps: TODO(alexander-soare): Document this somewhere when `load_previous_and_future_frames` is
+                refactored.
 
         """
-        self.set_delta_timestamps(delta_timestamps)
-        self._fps = fps
-        # Tolerance in seconds used to discard loaded frames when their timestamps are not close enough from
-        # the requested frames. It is only used when `delta_timestamps` is provided.
-        # minus 1e-4 to account for possible numerical error
-        self.tolerance_s = 1 / self.fps - 1e-4 if fps is not None else None
-        self._buffer_capacity = buffer_capacity
-        data_spec = self._make_data_spec(data_spec, buffer_capacity)
-        Path(write_dir).mkdir(parents=True, exist_ok=True)
+        # Parameters for the data structure.
+        self._storage_dir = Path(storage_dir)
         self._data: dict[str, np.memmap] = {}
+        self._is_video_dataset = False  # may be switched to True by `from_huggingface_hub`
+        self._videos_dir: str | None = None  # may be set by `from_huggingface_hub`
+
+        # If the storage directory already exists, load the memmaps.
+        if self._storage_dir.exists():
+            if buffer_capacity is not None:
+                raise ValueError(
+                    "The storage directory already exists, which means you should not provide a "
+                    "buffer_capacity explicitly. Instead, it will be read from 'meta.json' in the storage "
+                    "directory."
+                )
+            data_spec = self._load_data_spec()
+            self._make_memmaps(data_spec, mode="r+")
+            self._buffer_capacity = len(self._data[self.INDEX_KEY])
+        else:
+            if buffer_capacity is None:
+                raise ValueError(
+                    "The storage directory does not exist, which means you need to provide a buffer_capacity."
+                )
+            self._buffer_capacity = buffer_capacity
+
+        # Parameters for the item getter.
+        self._fps = fps
+        self.set_delta_timestamps(delta_timestamps)
+        self.image_transform = image_transform
+
+    @property
+    def storage_dir(self) -> Path:
+        return self._storage_dir
+
+    @property
+    def is_video_dataset(self) -> bool:
+        return self._is_video_dataset
+
+    @property
+    def data_keys(self) -> list[str]:
+        keys = set(self._data)
+        keys.remove(self.OCCUPANCY_MASK_KEY)
+        keys.remove(self.NEXT_INDEX_KEY)
+        return sorted(keys)
+
+    @property
+    def fps(self) -> float | None:
+        return self._fps
+
+    @property
+    def num_episodes(self) -> int:
+        """Total number of unique episode indices in the dataset."""
+        if len(self._data) == 0:
+            # Buffers not created yet.
+            return 0
+        return len(np.unique(self._data[self.EPISODE_INDEX_KEY][self._data[self.OCCUPANCY_MASK_KEY]]))
+
+    @property
+    def num_samples(self) -> int:
+        """Total number of unique samples (aka frames) in the dataset.
+
+        TODO(alexander-soare): Rename to num_frames once LeRobotDataset is deprecated.
+        """
+        if len(self._data) == 0:
+            # Buffers not created yet.
+            return 0
+        return np.count_nonzero(self._data[self.OCCUPANCY_MASK_KEY])
+
+    @property
+    def camera_keys(self) -> list[str]:
+        """Return the names of all data keys pertaining to camera observations.
+
+        By convention, this is all the keys starting with "observation.image".
+        """
+        return [k for k in self._data if k.startswith(self.IMAGE_KEY_PREFIX)]
+
+    def _save_data_spec(self, data_spec: dict[str, dict]):
+        """Save the data type and shape specifications to the storage directory."""
+        meta_file = self._storage_dir / self.METADATA_FILE_NAME
+        with open(meta_file, "w") as f:
+            for k in data_spec:
+                data_spec[k]["dtype"] = str(data_spec[k]["dtype"])
+            json.dump(data_spec, f, indent=2)
+
+    def _load_data_spec(self) -> dict[str, dict]:
+        """Load the data type and shape specifications from the storage directory."""
+        meta_file = self._storage_dir / self.METADATA_FILE_NAME
+        with open(meta_file) as f:
+            data_spec = json.load(f)
+        for k in data_spec:
+            data_spec[k]["dtype"] = np.dtype(data_spec[k]["dtype"])
+        return data_spec
+
+    def _make_storage_dir(self, episode_data: dict[str, np.ndarray]):
+        """Create the storage directory based on example episode data from the first `add_episodes` call."""
+        assert (
+            not self.storage_dir.exists()
+        ), "This method should only be called before the storage directory has been created."
+
+        self._storage_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            # Make the data spec for np.memmap
+            data_spec = {
+                self.NEXT_INDEX_KEY: {"dtype": np.dtype("int64"), "shape": (1,)},
+                self.OCCUPANCY_MASK_KEY: {"dtype": np.dtype("?"), "shape": (self._buffer_capacity,)},
+                self.INDEX_KEY: {"dtype": np.dtype("int64"), "shape": (self._buffer_capacity,)},
+                self.FRAME_INDEX_KEY: {"dtype": np.dtype("int64"), "shape": (self._buffer_capacity,)},
+                self.EPISODE_INDEX_KEY: {"dtype": np.dtype("int64"), "shape": (self._buffer_capacity,)},
+                self.TIMESTAMP_KEY: {"dtype": np.dtype("float32"), "shape": (self._buffer_capacity,)},
+            }
+            for k, v in episode_data.items():
+                if k in data_spec:
+                    continue
+                data_spec[k] = {"dtype": v.dtype, "shape": (self._buffer_capacity, *v.shape[1:])}
+
+            self._make_memmaps(data_spec, "w+")
+            self._save_data_spec(data_spec)
+        except Exception as e:
+            # Attempt to clean up by removing the empty storage directory.
+            shutil.rmtree(self._storage_dir)
+            raise e
+
+    def _make_memmaps(self, data_spec: dict[str, dict], mode: str):
+        """Create the memmap buffer objects.
+
+        The underlying storage directory may or may not already exist. Provide the file opening `mode`
+        accordingly.
+        """
         for k, v in data_spec.items():
             self._data[k] = _make_memmap_safe(
-                filename=Path(write_dir) / k,
+                filename=self._storage_dir / k,
                 dtype=v["dtype"] if v is not None else None,
-                mode="r+" if (Path(write_dir) / k).exists() else "w+",
+                mode=mode,
                 shape=tuple(v["shape"]) if v is not None else None,
             )
-        self.image_transforms = image_transforms
 
     @property
     def delta_timestamps(self) -> dict[str, np.ndarray] | None:
         return self._delta_timestamps
 
-    def set_delta_timestamps(self, value: dict[str, list[float]] | None):
+    @property
+    def tolerance_s(self) -> float | None:
+        """
+        Tolerance (in seconds) used to discard loaded frames when their timestamps are not close enough to
+        the requested frames. It is only used when `delta_timestamps` is provided. The -1e-4 accounts for
+        possible numerical error.
+        """
+        if self._fps is None:
+            return None
+        return 1 / self._fps - 1e-4
+
+    def set_delta_timestamps(self, delta_timestamps: dict[str, list[float]] | None):
         """Set delta_timestamps converting the values to numpy arrays.
 
-        The conversion is for an optimization in the __getitem__. The loop is much slower if the arrays
-        need to be converted into numpy arrays.
+        Note: The conversion is for an optimization in the __getitem__. The loop is much slower if lists need
+        to be converted into numpy arrays.
         """
-        if value is not None:
-            self._delta_timestamps = {k: np.array(v) for k, v in value.items()}
+        if delta_timestamps is not None and self._fps is None:
+            raise ValueError(
+                "`fps` must be provided to `__init__` if you want to provide `delta_timestamps`."
+            )
+
+        if delta_timestamps is not None:
+            self._delta_timestamps = {k: np.array(v) for k, v in delta_timestamps.items()}
         else:
             self._delta_timestamps = None
 
-    def _make_data_spec(self, data_spec: dict[str, Any], buffer_capacity: int) -> dict[str, dict[str, Any]]:
-        """Makes the data spec for np.memmap."""
-        if any(k.startswith("_") for k in data_spec):
-            raise ValueError(
-                "data_spec keys should not start with '_'. This prefix is reserved for internal logic."
-            )
-        preset_keys = {
-            OnlineBuffer.INDEX_KEY,
-            OnlineBuffer.FRAME_INDEX_KEY,
-            OnlineBuffer.EPISODE_INDEX_KEY,
-            OnlineBuffer.TIMESTAMP_KEY,
-        }
-        if len(intersection := set(data_spec).intersection(preset_keys)) > 0:
-            raise ValueError(
-                f"data_spec should not contain any of {preset_keys} as these are handled internally. "
-                f"The provided data_spec has {intersection}."
-            )
-        complete_data_spec = {
-            # _next_index will be a pointer to the next index that we should start filling from when we add
-            # more data.
-            OnlineBuffer.NEXT_INDEX_KEY: {"dtype": np.dtype("int64"), "shape": (1,)},
-            # Since the memmap is initialized with all-zeros, this keeps track of which indices are occupied
-            # with real data rather than the dummy initialization.
-            OnlineBuffer.OCCUPANCY_MASK_KEY: {"dtype": np.dtype("?"), "shape": (buffer_capacity,)},
-            OnlineBuffer.INDEX_KEY: {"dtype": np.dtype("int64"), "shape": (buffer_capacity,)},
-            OnlineBuffer.FRAME_INDEX_KEY: {"dtype": np.dtype("int64"), "shape": (buffer_capacity,)},
-            OnlineBuffer.EPISODE_INDEX_KEY: {"dtype": np.dtype("int64"), "shape": (buffer_capacity,)},
-            OnlineBuffer.TIMESTAMP_KEY: {"dtype": np.dtype("float64"), "shape": (buffer_capacity,)},
-        }
-        for k, v in data_spec.items():
-            complete_data_spec[k] = {"dtype": v["dtype"], "shape": (buffer_capacity, *v["shape"])}
-        return complete_data_spec
+    def add_episodes(self, data: dict[str, np.ndarray]):
+        """Add data to the buffer.
 
-    # def add_data(self, data: dict[str, np.ndarray]):
-    #     """Add new data to the buffer, which could potentially mean shifting old data out.
+        `data` should have the same key, array mapping as the buffer. It should contain at least one episode.
+        The episodes should have frame indices that start from 0 and step up in increments of 1.
 
-    #     The new data should contain all the frames (in order) of any number of episodes. The indices should
-    #     start from 0 (note to the developer: this can easily be generalized). See the `rollout` and
-    #     `eval_policy` functions in `eval.py` for more information on how the data is constructed.
+        Episodes are added to the buffer one-by-one. If an episode has more frames then are available till the
+        end of the buffer, the pointer is reset to the start of the buffer and the episode is inserted there,
+        overwriting existing episode frames.
 
-    #     Shift the incoming data index and episode_index to continue on from the last frame. Note that this
-    #     will be done in place!
-    #     """
-    #     if len(missing_keys := (set(self.data_keys).difference(set(data)))) > 0:
-    #         raise ValueError(f"Missing data keys: {missing_keys}")
-    #     new_data_length = len(data[self.data_keys[0]])
-    #     if not all(len(data[k]) == new_data_length for k in self.data_keys):
-    #         raise ValueError("All data items should have the same length")
+        When episode frames are overwritten by a new episode, by default, any remaining frames belonging to
+        the existing episode are left in place (meaning not all episodes will be guaranteed to start from
+        their frame 0).
 
-    #     next_index = self._data[OnlineBuffer.NEXT_INDEX_KEY][0]
-
-    #     # Sanity check to make sure that the new data indices start from 0.
-    #     assert data[OnlineBuffer.EPISODE_INDEX_KEY][0].item() == 0
-    #     assert data[OnlineBuffer.INDEX_KEY][0].item() == 0
-
-    #     # Shift the incoming indices if necessary.
-    #     if self.num_samples > 0:
-    #         last_episode_index = self._data[OnlineBuffer.EPISODE_INDEX_KEY][next_index - 1]
-    #         last_data_index = self._data[OnlineBuffer.INDEX_KEY][next_index - 1]
-    #         data[OnlineBuffer.EPISODE_INDEX_KEY] += last_episode_index + 1
-    #         data[OnlineBuffer.INDEX_KEY] += last_data_index + 1
-
-    #     # Insert the new data starting from next_index. It may be necessary to wrap around to the start.
-    #     n_surplus = max(0, new_data_length - (self._buffer_capacity - next_index))
-    #     for k in self.data_keys:
-    #         if n_surplus == 0:
-    #             slc = slice(next_index, next_index + new_data_length)
-    #             self._data[k][slc] = data[k]
-    #             self._data[OnlineBuffer.OCCUPANCY_MASK_KEY][slc] = True
-    #         else:
-    #             self._data[k][next_index:] = data[k][:-n_surplus]
-    #             self._data[OnlineBuffer.OCCUPANCY_MASK_KEY][next_index:] = True
-    #             self._data[k][:n_surplus] = data[k][-n_surplus:]
-    #     if n_surplus == 0:
-    #         self._data[OnlineBuffer.NEXT_INDEX_KEY][0] = next_index + new_data_length
-    #     else:
-    #         self._data[OnlineBuffer.NEXT_INDEX_KEY][0] = n_surplus
-
-    #     # Invalidate any episodes that don't start from their first frame. This can happen if the start of
-    #     # an episode was overwritten by incoming data.
-    #     pass
-
-    def add_data(self, data: dict[str, np.ndarray]):
-        for episode_index in np.unique(data[OnlineBuffer.EPISODE_INDEX_KEY]):
-            where_episode = np.where(data[OnlineBuffer.EPISODE_INDEX_KEY] == episode_index)[0]
+        After adding the episodes to the buffer, the buffer is flushed to disk.
+        """
+        for episode_index in np.unique(data[self.EPISODE_INDEX_KEY]):
+            where_episode = np.where(data[self.EPISODE_INDEX_KEY] == episode_index)[0]
             episode_data = {k: data[k][where_episode] for k in data}
-            self.add_episode(episode_data)
+            self._add_episode(episode_data)
 
-    def add_episode(self, data: dict[str, np.ndarray]):
+        self.flush()
+
+    def _add_episode(self, data: dict[str, np.ndarray]):
+        """Add data for a single episode to the buffer."""
+        if len(self._data) == 0:
+            self._make_storage_dir(data)
+
         if len(missing_keys := (set(self.data_keys).difference(set(data)))) > 0:
             raise ValueError(f"Missing data keys: {missing_keys}")
         new_data_length = len(data[self.data_keys[0]])
@@ -233,23 +346,42 @@ class OnlineBuffer(torch.utils.data.Dataset):
             raise ValueError("The episode length is larger than the buffer capacity.")
         if not all(len(data[k]) == new_data_length for k in self.data_keys):
             raise ValueError("All data items should have the same length")
-        if not np.all(data[OnlineBuffer.EPISODE_INDEX_KEY] == data[OnlineBuffer.EPISODE_INDEX_KEY][0]):
+        if not np.all(data[self.EPISODE_INDEX_KEY] == data[self.EPISODE_INDEX_KEY][0]):
             raise ValueError(
                 "New data should only contain one episode but there is more than one unique episode index."
             )
-        if not np.array_equal(data[OnlineBuffer.FRAME_INDEX_KEY], np.arange(new_data_length)):
+        if not np.array_equal(data[self.FRAME_INDEX_KEY], np.arange(new_data_length)):
             raise ValueError(
                 "Expected frame indices to start from 0 and step up in increments of 1 per frame."
             )
+        # Special checks on image keys.
+        for k in data:
+            if not k.startswith(self.IMAGE_KEY_PREFIX):
+                continue
+            if self._is_video_dataset:
+                if data[k].dtype != np.dtype(f"S{MAX_VIDEO_PATH_LENGTH}"):
+                    raise ValueError(
+                        f"Any data key starting with '{self.IMAGE_KEY_PREFIX}' is assumed to be an image, "
+                        "and in a video dataset it should be string data (with a relative path to the video "
+                        "to be loaded)."
+                    )
+            else:
+                _, h, w, c = data[k].shape
+                if data[k].dtype is not np.dtype("uint8") or c >= min(h, w):
+                    raise ValueError(
+                        f"Any data key starting with '{self.IMAGE_KEY_PREFIX}' is assumed to be an image, "
+                        "and should be of type np.uint8, with channel-last format."
+                    )
 
-        next_index = self._data[OnlineBuffer.NEXT_INDEX_KEY][0]
+        # Figure out where we need to start filling data next, and make sure we continue data and episode
+        # indices.
+        next_index = self._data[self.NEXT_INDEX_KEY][0]
         if self.num_samples > 0:
-            last_episode_index = self._data[OnlineBuffer.EPISODE_INDEX_KEY][next_index - 1]
-            last_data_index = self._data[OnlineBuffer.INDEX_KEY][next_index - 1]
+            last_episode_index = self._data[self.EPISODE_INDEX_KEY][next_index - 1]
+            last_data_index = self._data[self.INDEX_KEY][next_index - 1]
         else:
             last_episode_index = -1
             last_data_index = -1
-
         # If there aren't enough slots in the buffer left to accommodate the episode, wrap to the start.
         if max(0, new_data_length - (self._buffer_capacity - next_index)) > 0:
             next_index = 0
@@ -257,157 +389,262 @@ class OnlineBuffer(torch.utils.data.Dataset):
         # Insert the new data starting from next_index.
         for k in self.data_keys:
             slc = slice(next_index, next_index + new_data_length)
-            if k == OnlineBuffer.EPISODE_INDEX_KEY:
+            if k == self.EPISODE_INDEX_KEY:
                 self._data[k][slc] = last_episode_index + 1
-            elif k == OnlineBuffer.INDEX_KEY:
+            elif k == self.INDEX_KEY:
                 self._data[k][slc] = np.arange(last_data_index + 1, last_data_index + 1 + new_data_length)
             else:
                 self._data[k][slc] = data[k]
-            self._data[OnlineBuffer.OCCUPANCY_MASK_KEY][slc] = True
+            self._data[self.OCCUPANCY_MASK_KEY][slc] = True
 
-        self._data[OnlineBuffer.NEXT_INDEX_KEY][0] = next_index + new_data_length
+        # Update the data pointer.
+        self._data[self.NEXT_INDEX_KEY][0] = next_index + new_data_length
 
-        # # At this point, it's possible that the beginning of an existing episode was overwritten. Invalidate
-        # # the whole episode.
-        # for episode_index in np.unique(self._data[OnlineBuffer.EPISODE_INDEX_KEY]):
-        #     where_episode = np.where(self._data[OnlineBuffer.EPISODE_INDEX_KEY] == episode_index)[0]
-        #     if self._data[OnlineBuffer.FRAME_INDEX_KEY][where_episode[0]] != 0:
-        #         self._data[OnlineBuffer.OCCUPANCY_MASK_KEY][where_episode] = False
+    def flush(self):
+        """Save the data to disk.
 
-    @property
-    def data_keys(self) -> list[str]:
-        keys = set(self._data)
-        keys.remove(OnlineBuffer.OCCUPANCY_MASK_KEY)
-        keys.remove(OnlineBuffer.NEXT_INDEX_KEY)
-        return sorted(keys)
+        `np.memmap`s keep a portion of the data mirrored in memory. Updates to the in-memory data are not
+        immediately reflected on disk. Call this method to explicitly save the updates to disk.
+        """
+        for k in self._data:
+            self._data[k].flush()
 
-    @property
-    def fps(self) -> float | None:
-        return self._fps
-
-    @property
-    def num_episodes(self) -> int:
-        return len(
-            np.unique(self._data[OnlineBuffer.EPISODE_INDEX_KEY][self._data[OnlineBuffer.OCCUPANCY_MASK_KEY]])
-        )
-
-    @property
-    def num_samples(self) -> int:
-        return np.count_nonzero(self._data[OnlineBuffer.OCCUPANCY_MASK_KEY])
-
-    def __len__(self):
-        return self.num_samples
-
-    def _item_to_tensors(self, item: dict) -> dict:
+    @staticmethod
+    def _item_to_tensors(item: dict) -> dict:
         item_ = {}
         for k, v in item.items():
-            if isinstance(v, torch.Tensor):
-                item_[k] = v
-            elif isinstance(v, np.ndarray):
+            if isinstance(v, np.ndarray):
                 item_[k] = torch.from_numpy(v)
+            elif isinstance(v, torch.Tensor):
+                item_[k] = v
+            elif isinstance(v, np.bool_):
+                # Note: This is not necessary vs just doing torch.tensor(v), but it dodges a
+                # DeprecationWarning from torch.
+                item_[k] = torch.tensor(bool(v))
             else:
                 item_[k] = torch.tensor(v)
         return item_
 
-    @property
-    def camera_keys(self) -> list[str]:
-        """Keys to access image and video stream from cameras."""
-        return [k for k in self._data if k.startswith("observation.image")]
+    def __len__(self):
+        return self.num_samples
 
-    def _optimized_advanced_slice(self, data_key: str, indices: np.ndarray) -> np.ndarray:
-        """Convert advanced slicing to basic slicing by finding contiguous ranges in the requested indices.
-
-        TODO(now): For sequentially repeated indices we use numpy repeat.
-        """
-        indices_diff = np.diff(indices, prepend=indices[0] - 1)
-        where_not_1 = np.where(indices_diff != 1)[0]
-        ptr = 0
-        ret = []
-        for ix in chain(where_not_1, [len(indices)]):
-            ret.append(self._data[data_key][indices[ptr] : indices[ix - 1] + 1])
-            ptr = ix
-
-        # Avoid creating a copy with concatenate if possible.
-        return np.concatenate(ret) if len(ret) > 1 else ret[0]
+    def get_data_by_key(self, key: str) -> np.ndarray:
+        """Returns all data for a given data key (where the data is valid)."""
+        return self._data[key][self._data[self.OCCUPANCY_MASK_KEY]]
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        """Gets an item or slice from the buffer and returns it in PyTorch format.
+
+        Images (any data key starting with "observation.image") get converted from numpy uint8, in range
+        [0, 255], channel-first to torch float32, in range [0, 1], channel-last.
+
+        If `delta_timestamps` is set... TODO(alexander-soare): Document this somewhere when
+        `load_previous_and_future_frames` is refactored.
+        """
         if idx >= len(self) or idx < -len(self):
             raise IndexError
 
         item = {k: v[idx] for k, v in self._data.items() if not k.startswith("_")}
 
-        if self.delta_timestamps is None:
-            return self._item_to_tensors(item)
+        # If we are using delta_timestamps take slices of the data.
+        if self.delta_timestamps is not None:
+            episode_index = item[self.EPISODE_INDEX_KEY]
+            current_ts = item[self.TIMESTAMP_KEY]
+            episode_data_indices = np.where(
+                np.bitwise_and(
+                    self._data[self.EPISODE_INDEX_KEY] == episode_index,
+                    self._data[self.OCCUPANCY_MASK_KEY],
+                )
+            )[0]
+            episode_timestamps = self._data[self.TIMESTAMP_KEY][episode_data_indices]
 
-        episode_index = item[OnlineBuffer.EPISODE_INDEX_KEY]
-        current_ts = item[OnlineBuffer.TIMESTAMP_KEY]
-        episode_data_indices = np.where(
-            np.bitwise_and(
-                self._data[OnlineBuffer.EPISODE_INDEX_KEY] == episode_index,
-                self._data[OnlineBuffer.OCCUPANCY_MASK_KEY],
-            )
-        )[0]
-        episode_timestamps = self._data[OnlineBuffer.TIMESTAMP_KEY][episode_data_indices]
+            if self.is_video_dataset:
+                # We'll use this for `decode_video_frames_torchvision`.
+                video_delta_timestamps = {}
 
-        for data_key in self.delta_timestamps:
-            # Note: The logic in this loop is copied from `load_previous_and_future_frames`.
-            # Get timestamps used as query to retrieve data of previous/future frames.
-            query_ts = current_ts + self.delta_timestamps[data_key]
+            for data_key in self.delta_timestamps:
+                # Get timestamps used as query to retrieve data of previous/future frames.
+                query_ts = current_ts + self.delta_timestamps[data_key]
 
-            # Compute distances between each query timestamp and all timestamps of all the frames belonging to
-            # the episode.
-            dist = np.abs(query_ts[:, None] - episode_timestamps[None, :])
-            argmin_ = np.argmin(dist, axis=1)
-            min_ = dist[np.arange(dist.shape[0]), argmin_]
+                # Compute distances between each query timestamp and all timestamps of all the frames
+                # belonging to the episode.
+                dist = np.abs(query_ts[:, None] - episode_timestamps[None, :])
+                argmin_ = np.argmin(dist, axis=1)
+                min_ = dist[np.arange(dist.shape[0]), argmin_]
 
-            is_pad = min_ > self.tolerance_s
+                is_pad = min_ > self.tolerance_s
 
-            # Check violated query timestamps are all outside the episode range.
-            try:
-                assert (
+                # Check violated query timestamps are all outside the episode range.
+                if not (
                     (query_ts[is_pad] < episode_timestamps[0]) | (episode_timestamps[-1] < query_ts[is_pad])
-                ).all(), (
-                    f"One or several timestamps unexpectedly violate the tolerance ({min_} > {self.tolerance_s=}"
-                    ") inside the episode range."
+                ).all():
+                    raise TimestampOutsideToleranceError(
+                        f"One or several timestamps unexpectedly violate the tolerance ({min_} > "
+                        f"{self.tolerance_s=}) inside the episode range."
+                    )
+
+                if self.is_video_dataset and data_key.startswith(self.IMAGE_KEY_PREFIX):
+                    video_delta_timestamps[data_key] = self._data[self.TIMESTAMP_KEY][
+                        episode_data_indices[argmin_]
+                    ]
+                else:
+                    item[data_key] = self._data[data_key][episode_data_indices[argmin_]]
+
+                item[f"{data_key}{self.IS_PAD_POSTFIX}"] = is_pad
+
+        if self.is_video_dataset:
+            # Decode the required video frames.
+            for k in self.camera_keys:
+                this_key_has_delta_timestamps = (
+                    self.delta_timestamps is not None and k in self.delta_timestamps
                 )
-            except AssertionError:
-                logging.warning(
-                    f"One or several timestamps unexpectedly violate the tolerance ({min_} > {self.tolerance_s=}"
-                    ") inside the episode range."
+                requested_timestamps = (
+                    video_delta_timestamps[k] if this_key_has_delta_timestamps else [item[self.TIMESTAMP_KEY]]
                 )
-                return self.__getitem__(np.random.choice(len(self)))
+                img_or_imgs = decode_video_frames_torchvision(
+                    video_path=self.storage_dir / item[k].decode(),
+                    timestamps=requested_timestamps,
+                    tolerance_s=self.tolerance_s or 1e-8,  # 1e-8 to account for no fps setting
+                    backend="pyav",
+                    to_pytorch_format=True,
+                )
+                if this_key_has_delta_timestamps:
+                    item[k] = img_or_imgs
+                else:
+                    item[k] = img_or_imgs[0]  # in this case we don't want a temporal dimension
+        else:
+            # Convert to PyTorch format: channel-last, float32, normalize to range [0, 1].
+            for k in self.camera_keys:
+                item[k] = einops.rearrange(
+                    torch.from_numpy(item[k].astype(np.float32) / 255.0), "... h w c -> ... c h w"
+                )
 
-            # Load frames for this data key.
-            if np.any(np.diff(argmin_) != 1):
-                item[data_key] = self._data[data_key][episode_data_indices[argmin_]]
-                # item[data_key] = self._optimized_advanced_slice(data_key, episode_data_indices[argmin_])
-            else:
-                # Do basic slicing where possible
-                item[data_key] = self._data[data_key][
-                    episode_data_indices[argmin_.min()] : episode_data_indices[argmin_.max()] + 1
-                ]
-
-            item[f"{data_key}{OnlineBuffer.IS_PAD_POSTFIX}"] = is_pad
-
-        if self.image_transforms is not None:
-            for cam in self.camera_keys:
-                item[cam] = self.image_transforms(item[cam])
+        if self.image_transform is not None:
+            for k in self.camera_keys:
+                item[k] = self.image_transform(item[k])
 
         return self._item_to_tensors(item)
 
-    def flush(self):
-        for k in self._data:
-            self._data[k].flush()
+    @classmethod
+    def from_huggingface_hub(
+        cls,
+        repo_id: str,
+        decode_video: bool = False,
+        root: Path | None = DATA_DIR,
+        verbose: bool = False,
+        **kwargs,
+    ) -> "DataBuffer":
+        """Create a DataBuffer from a data repository on the Hugging Face Hub.
 
-    def get_data_by_key(self, key: str) -> torch.Tensor:
-        """Returns all data for a given data key as a Tensor."""
-        return torch.from_numpy(self._data[key][self._data[OnlineBuffer.OCCUPANCY_MASK_KEY]])
+        NOTE: If the DataBuffer already exists in /tmp, this function will reuse it rather than creating a new
+        one.
+
+        Args:
+            repo_id: The dataset repository ID.
+            decode_video: If repo_id refers to a video dataset (the image observations are encoded as videos),
+                decode the videos and store the frames in a numpy memmap.
+            root: (will be deprecated) Directory to load the dataset from, instead of the hub.
+            **kwargs: Other arguments to `self.__init__` except for the `data_spec` and
+                `buffer_capacity` arguments which are inferred automatically. `storage_dir` is set to
+                `/tmp/{repo_id}_{hf_dataset._fingerprint}_{decoded?}` unless provided explicitly.
+        Returns:
+            The resulting DataBuffer object.
+        """
+        for k in ["data_spec", "buffer_capacity"]:
+            if k in kwargs:
+                raise ValueError(f"`{k}` should not be provided as it is inferred from the hub dataset.")
+
+        hf_dataset = load_hf_dataset(repo_id, version=CODEBASE_VERSION, root=root, split="train")
+        hf_dataset.set_transform(lambda x: x)
+        # Get some metadata necessary for processing videos.
+        lerobot_dataset_info = load_info(repo_id, version=CODEBASE_VERSION, root=root)
+        if not lerobot_dataset_info.get("video", False) and decode_video:
+            raise ValueError(f"The provided dataset is not a video dataset but you have {decode_video=}")
+        if lerobot_dataset_info.get("video", False):
+            videos_path = load_videos(repo_id, version=CODEBASE_VERSION, root=root)
+
+        kwargs.setdefault(
+            "storage_dir",
+            DataBuffer._default_storage_dir_from_huggingface_hub(
+                repo_id, hf_dataset._fingerprint, decode_video
+            ),
+        )
+
+        buffer_already_on_disk = False
+        if kwargs["storage_dir"].exists():
+            buffer_already_on_disk = True
+
+        # Create the DataBuffer object. Reminder: if the storage directory already exists, this reads it.
+        # Otherwise, the storage directory is not created until later when we make the first call to
+        # `add_episodes`.
+        obj = cls(
+            **kwargs,
+            buffer_capacity=len(hf_dataset) if not buffer_already_on_disk else None,
+        )
+
+        if lerobot_dataset_info.get("video", False) and not decode_video:
+            obj._is_video_dataset = True
+        if obj._is_video_dataset:
+            obj._videos_dir = kwargs["storage_dir"] / "videos"
+
+        # If we have accessed an existing cached data buffer, just return the object as is.
+        if buffer_already_on_disk:
+            return obj
+
+        # Populate the buffer with the data from the dataset.
+        data_dict = {}
+        for k, feature in hf_dataset.features.items():
+            if isinstance(feature, datasets.features.Image):
+                data_dict[k] = np.stack([np.array(pil_img) for pil_img in hf_dataset[k]])
+            elif isinstance(feature, VideoFrame):
+                if decode_video:
+                    # Decode all videos into images.
+                    episode_indices = np.array(hf_dataset["episode_index"])
+                    timestamps = np.array(hf_dataset["timestamp"])
+                    all_imgs = []
+                    for episode_index in tqdm(
+                        np.unique(episode_indices), desc=f"Decoding videos for {k}", disable=inside_slurm()
+                    ):
+                        episode_data_indices = np.where(episode_indices == episode_index)[0]
+                        episode_timestamps = timestamps[episode_indices == episode_index]
+                        episode_imgs = decode_video_frames_torchvision(
+                            videos_path.parent / hf_dataset[k][episode_data_indices[0]]["path"],
+                            episode_timestamps,
+                            1 / lerobot_dataset_info["fps"] - 1e-4,
+                            to_pytorch_format=False,
+                        )
+                        all_imgs.extend(episode_imgs)
+                    data_dict[k] = np.stack(all_imgs)
+                else:
+                    data_dict[k] = np.stack(
+                        [np.array(dct["path"], dtype=f"S{MAX_VIDEO_PATH_LENGTH}") for dct in hf_dataset[k]]
+                    )
+            elif isinstance(feature, datasets.features.Sequence):
+                data_dict[k] = np.array(hf_dataset[k], dtype=np.dtype(feature.feature.dtype))
+            elif isinstance(feature, datasets.features.Value):
+                data_dict[k] = np.array(hf_dataset[k], dtype=np.dtype(feature.dtype))
+            else:
+                raise NotImplementedError(f"feature type {type(feature)} is not handled.")
+
+        obj.add_episodes(data_dict)  # note this must happen after setting _is_video_dataset.
+        # Symlink vidoes if needed.
+        if obj._is_video_dataset and not obj._videos_dir.exists():
+            os.symlink(videos_path.absolute(), obj._videos_dir)
+        return obj
+
+    @staticmethod
+    def _default_storage_dir_from_huggingface_hub(repo_id: str, fingerprint: str, decode_video: bool) -> Path:
+        """Create the default storage directory used for the `from_huggingface_hub` method.
+
+        Note: This method is really meant for development / testing.
+        """
+        return Path(f"/tmp/{repo_id}_{fingerprint}{'_decoded' if decode_video else ''}")
 
 
 def compute_sampler_weights(
     offline_dataset: LeRobotDataset,
     offline_drop_n_last_frames: int = 0,
-    online_dataset: OnlineBuffer | None = None,
+    online_dataset: DataBuffer | None = None,
     online_sampling_ratio: float | None = None,
     online_drop_n_last_frames: int = 0,
 ) -> torch.Tensor:
@@ -416,7 +653,7 @@ def compute_sampler_weights(
     Args:
         offline_dataset: The LeRobotDataset used for offline pre-training.
         online_drop_n_last_frames: Number of frames to drop from the end of each offline dataset episode.
-        online_dataset: The OnlineBuffer used in online training.
+        online_dataset: The DataBuffer used in online training.
         online_sampling_ratio: The proportion of data that should be sampled from the online dataset. If an
             online dataset is provided, this value must also be provided.
         online_drop_n_first_frames: See `offline_drop_n_last_frames`. This is the same, but for the online
@@ -464,9 +701,9 @@ def compute_sampler_weights(
 
     if online_dataset is not None and len(online_dataset) > 0:
         online_data_mask_indices = []
-        episode_indices = online_dataset.get_data_by_key("episode_index")
-        for episode_idx in torch.unique(episode_indices):
-            where_episode = torch.where(episode_indices == episode_idx)
+        episode_indices = online_dataset.get_data_by_key(DataBuffer.EPISODE_INDEX_KEY)
+        for episode_idx in np.unique(episode_indices):
+            where_episode = np.where(episode_indices == episode_idx)
             start_index = where_episode[0][0]
             end_index = where_episode[0][-1] + 1
             online_data_mask_indices.extend(
