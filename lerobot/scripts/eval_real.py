@@ -26,9 +26,8 @@ from lerobot.common.rl import (
     calc_reward_cube_push,
     reset_for_cube_push,
 )
-from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
 from lerobot.common.robot_devices.robots.factory import make_robot
-from lerobot.common.robot_devices.robots.koch import KochRobot
+from lerobot.common.robot_devices.robots.manipulator import ManipulatorRobot
 from lerobot.common.robot_devices.teleoperators.ps5_controller import PS5Controller
 from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.digital_twin import DigitalTwin
@@ -58,7 +57,7 @@ def say(text, blocking=False):
 
 
 def rollout(
-    robot: KochRobot,
+    robot: ManipulatorRobot,
     policy: Policy,
     fps: float,
     n_action_buffer: int = 0,
@@ -99,11 +98,11 @@ def rollout(
     elif random.random() > 0.5:
         goal_mask = goal_mask_right  # goal is on the right
         goal = "right"
-        start_pos = "left" if random.random() < 0.9 else "right"  # make it more likely to start left
+        start_pos = "left"  # if random.random() < 0.9 else "right"  # make it more likely to start left
     else:
         goal_mask = goal_mask_left  # goal is on the left
         goal = "left"
-        start_pos = "right" if random.random() < 0.9 else "left"  # make it more likely to start right
+        start_pos = "right"  # if random.random() < 0.9 else "left"  # make it more likely to start right
     say(f"Go {goal}", blocking=True)
     reset_for_cube_push(robot, right=start_pos == "right")
 
@@ -149,10 +148,10 @@ def rollout(
             episode_data["frame_index"].append(step)
             for k in observation:
                 if k.startswith("observation.image"):
+                    img = observation[k].numpy().copy()
                     # HACK use masking to indicate to policy which side needs the cube:
-                    img = observation[k].to(dtype=torch.float32) / 255.0
-                    img[where_goal] = img[where_goal] / 2 + 0.5
-                    episode_data[k].append(img.permute(2, 0, 1).contiguous().numpy())
+                    img[where_goal] = img[where_goal] // 2 + np.array([127, 127, 127])
+                    episode_data[k].append(img)
                 else:
                     episode_data[k].append(observation[k].numpy())
 
@@ -364,6 +363,8 @@ def rollout(
 
     for k in episode_data:
         episode_data[k] = np.stack(episode_data[k])
+        if k in ["action", "observation.state", "next.reward", "timestamp"]:
+            episode_data[k] = episode_data[k].astype(np.float32)
 
     # HACK: drop the first frame because of first inference being slow.
     for k in episode_data:
@@ -471,10 +472,10 @@ def eval_policy(
     }
 
     # HACK: Bail on autonomous training
-    if eval_info["aggregated"]["pc_success"] == 0:
-        robot.follower_arms["main"].write("Torque_Enable", TorqueMode.DISABLED.value)
-        print("Exited after 0 success")
-        exit()
+    # if eval_info["aggregated"]["pc_success"] == 0:
+    #     robot.follower_arms["main"].write("Torque_Enable", TorqueMode.DISABLED.value)
+    #     print("Exited after 0 success")
+    #     exit()
 
     return eval_info
 

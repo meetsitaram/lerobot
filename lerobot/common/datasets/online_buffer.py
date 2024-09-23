@@ -679,15 +679,35 @@ def compute_sampler_weights(
 
     weights = []
 
-    if len(offline_dataset) > 0:
+    # if len(offline_dataset) > 0:
+    #     offline_data_mask_indices = []
+    #     for start_index, end_index in zip(
+    #         offline_dataset.episode_data_index["from"],
+    #         offline_dataset.episode_data_index["to"],
+    #         strict=True,
+    #     ):
+    #         offline_data_mask_indices.extend(
+    #             range(start_index.item(), end_index.item() - offline_drop_n_last_frames)
+    #         )
+    #     offline_data_mask = torch.zeros(len(offline_dataset), dtype=torch.bool)
+    #     offline_data_mask[torch.tensor(offline_data_mask_indices)] = True
+    #     weights.append(
+    #         torch.full(
+    #             size=(len(offline_dataset),),
+    #             fill_value=offline_sampling_ratio / offline_data_mask.sum(),
+    #         )
+    #         * offline_data_mask
+    #     )
+
+    if offline_dataset is not None and len(offline_dataset) > 0:
         offline_data_mask_indices = []
-        for start_index, end_index in zip(
-            offline_dataset.episode_data_index["from"],
-            offline_dataset.episode_data_index["to"],
-            strict=True,
-        ):
+        episode_indices = offline_dataset.get_data_by_key(DataBuffer.EPISODE_INDEX_KEY)
+        for episode_idx in np.unique(episode_indices):
+            where_episode = np.where(episode_indices == episode_idx)
+            start_index = where_episode[0][0]
+            end_index = where_episode[0][-1] + 1
             offline_data_mask_indices.extend(
-                range(start_index.item(), end_index.item() - offline_drop_n_last_frames)
+                range(start_index.item(), end_index.item() - online_drop_n_last_frames)
             )
         offline_data_mask = torch.zeros(len(offline_dataset), dtype=torch.bool)
         offline_data_mask[torch.tensor(offline_data_mask_indices)] = True

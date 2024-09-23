@@ -14,8 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-import os
-import platform
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -32,21 +30,19 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 from termcolor import colored
 from torch import nn
 from torch.cuda.amp import GradScaler
-from tqdm import tqdm
 
 from lerobot.common.datasets.factory import make_dataset, resolve_delta_timestamps
-from lerobot.common.datasets.lerobot_dataset import CODEBASE_VERSION, MultiLeRobotDataset
-from lerobot.common.datasets.online_buffer import OnlineBuffer, compute_sampler_weights
+from lerobot.common.datasets.lerobot_dataset import MultiLeRobotDataset
+from lerobot.common.datasets.online_buffer import DataBuffer, compute_sampler_weights
 from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.utils import cycle
-from lerobot.common.datasets.video_utils import load_from_videos
 from lerobot.common.envs.factory import make_env
 from lerobot.common.logger import Logger, log_output_dir
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.policies.policy_protocol import PolicyWithUpdate
 from lerobot.common.policies.utils import get_device_from_parameters
 from lerobot.common.robot_devices.robots.factory import make_robot
-from lerobot.common.robot_devices.robots.koch import KochRobot
+from lerobot.common.robot_devices.robots.manipulator import ManipulatorRobot
 from lerobot.common.utils.utils import (
     format_big_number,
     get_safe_torch_device,
@@ -243,26 +239,6 @@ def log_eval_info(logger, info, step, cfg, dataset, is_online):
     logger.log_dict(info, step, mode="eval")
 
 
-def say(text, blocking=False):
-    # Check if mac, linux, or windows.
-    if platform.system() == "Darwin":
-        cmd = f'say "{text}"'
-    elif platform.system() == "Linux":
-        cmd = f'spd-say "{text}"'
-    elif platform.system() == "Windows":
-        cmd = (
-            'PowerShell -Command "Add-Type -AssemblyName System.Speech; '
-            f"(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{text}')\""
-        )
-
-    if not blocking and platform.system() in ["Darwin", "Linux"]:
-        # TODO(rcadene): Make it work for Windows
-        # Use the ampersand to run command in the background
-        cmd += " &"
-
-    os.system(cmd)
-
-
 def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
     if out_dir is None:
         raise NotImplementedError()
@@ -433,82 +409,6 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             )
             logging.info("Resume training")
 
-    resolve_delta_timestamps(cfg)  # will be needed by OnlineBuffer
-    offline_dataset_cache = None
-    if cfg.training.use_offline_dataset_cache:
-        offline_dataset_cache = OnlineBuffer(
-            (
-                f"/tmp/{offline_dataset.repo_id.replace('/', '__')}_{CODEBASE_VERSION}_"
-                f"{str(offline_dataset.root).replace('/', '__')}_{offline_dataset.split}"
-            ),
-            data_spec={
-                **{
-                    k: {"shape": v, "dtype": np.dtype("float32")}
-                    for k, v in policy.config.input_shapes.items()
-                },
-                **{
-                    k: {"shape": v, "dtype": np.dtype("float32")}
-                    for k, v in policy.config.output_shapes.items()
-                },
-                "next.reward": {"shape": (), "dtype": np.dtype("float32")},
-                "next.done": {"shape": (), "dtype": np.dtype("?")},
-                "next.success": {"shape": (), "dtype": np.dtype("?")},
-            },
-            buffer_capacity=len(offline_dataset),
-            fps=offline_dataset.fps,
-            image_transforms=offline_dataset.image_transforms,
-            delta_timestamps=cfg.training.delta_timestamps,
-        )
-        # Temporarily disable transforms in offline dataset while we iterate through it.
-        offline_dataset.image_transforms = None
-        episode_index = 0
-        episode_frames = []
-        logging.info(
-            "Populating offline dataset cache. If a segmentation fault happens afterwards (and it's the first "
-            "time creating the cache) just rerun."
-        )
-        # Build up episode_data dictionaries from episodes one at a time and add them to the cache.
-        for i in tqdm(
-            range(len(offline_dataset.hf_dataset)),
-            total=len(offline_dataset),
-            desc="Populate offline dataset cache",
-        ):
-            if offline_dataset_cache.num_samples > i:
-                # Already cached.
-                continue
-            frame = offline_dataset.hf_dataset[i]
-            frame = load_from_videos(
-                frame,
-                offline_dataset.video_frame_keys,
-                offline_dataset.videos_dir,
-                offline_dataset.tolerance_s,
-                offline_dataset.video_backend,
-            )
-            # Add data to the cache when a full episode has been gathered.
-            if frame["episode_index"] > episode_index or i == len(offline_dataset) - 1:
-                if i == len(offline_dataset) - 1:
-                    episode_frames.append(frame)
-                episode_data = {}
-                for k in episode_frames[0]:
-                    episode_data[k] = torch.stack([f[k] for f in episode_frames])
-                episode_data[OnlineBuffer.EPISODE_INDEX_KEY] *= 0
-                episode_data[OnlineBuffer.INDEX_KEY] = (
-                    episode_data[OnlineBuffer.INDEX_KEY] - episode_data[OnlineBuffer.INDEX_KEY][0]
-                )
-                episode_data["action"] = np.diff(
-                    episode_data["action"], axis=0, prepend=episode_data["action"][:1]
-                )
-                episode_data["action"] = np.clip(episode_data["action"], -CLIP, CLIP)
-                offline_dataset_cache.add_data(episode_data)
-                episode_index += 1
-                episode_frames = []
-            episode_frames.append(frame)
-        # Sanity check to make sure we copied all data.
-        assert offline_dataset_cache.num_samples == len(offline_dataset)
-        # Re-enable image transforms in offline dataset (which we disabled before to siphon the
-        # untransformed images into the cache).
-        offline_dataset.image_transforms = offline_dataset_cache.image_transforms
-
     # create dataloader for offline training
     if cfg.training.get("drop_n_last_frames"):
         shuffle = False
@@ -520,8 +420,35 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     else:
         shuffle = True
         sampler = None
+
+    # if cfg.get("use_lerobot_data_buffer", False):
+    #     logging.info("Siphoning the dataset into a DataBuffer.")
+    #     decode_video = offline_dataset.video and cfg.get("lerobot_data_buffer_decode_video", False)
+    #     if decode_video:
+    #         logging.info(
+    #             "You have chosen to decode the video. It could take some time to populate the buffer "
+    #             "depending on the amount of data (but it only needs to happen once, and data loading will be "
+    #             "fast!)"
+    #         )
+    #     offline_dataset_for_dataloader = DataBuffer.from_huggingface_hub(
+    #         offline_dataset.repo_id,
+    #         fps=offline_dataset.fps,
+    #         delta_timestamps=offline_dataset.delta_timestamps,
+    #         decode_video=decode_video,
+    #     )
+    # else:
+    #     offline_dataset_for_dataloader = offline_dataset
+
+    # HACK
+    offline_dataset_for_dataloader = DataBuffer(
+        "data/offline_buffer",
+        image_transform=offline_dataset.image_transforms,
+        delta_timestamps=offline_dataset.delta_timestamps,
+        fps=FPS,
+    )
+
     dataloader = torch.utils.data.DataLoader(
-        offline_dataset_cache if cfg.training.use_offline_dataset_cache else offline_dataset,
+        offline_dataset_for_dataloader,
         num_workers=cfg.training.num_workers,
         persistent_workers=cfg.training.num_workers > 0,
         batch_size=cfg.training.batch_size,
@@ -577,7 +504,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
     # Create an env dedicated to online episodes collection from policy rollout.
     # online_env = make_env(cfg, n_envs=cfg.training.online_rollout_batch_size)
-    robot: KochRobot = make_robot(init_hydra_config("lerobot/configs/robot/koch_.yaml"))
+    robot: ManipulatorRobot = make_robot(init_hydra_config("lerobot/configs/robot/koch_.yaml"))
     robot.connect()
 
     online_buffer_path = logger.log_dir / "online_buffer"
@@ -590,36 +517,29 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             "was made. This is because the online buffer is updated on disk during training, independently "
             "of our explicit checkpointing mechanisms."
         )
-    online_dataset = OnlineBuffer(
+    online_dataset = DataBuffer(
         online_buffer_path,
-        data_spec={
-            **{k: {"shape": v, "dtype": np.dtype("float32")} for k, v in policy.config.input_shapes.items()},
-            **{k: {"shape": v, "dtype": np.dtype("float32")} for k, v in policy.config.output_shapes.items()},
-            "next.reward": {"shape": (), "dtype": np.dtype("float32")},
-            "next.done": {"shape": (), "dtype": np.dtype("?")},
-            "next.success": {"shape": (), "dtype": np.dtype("?")},
-        },
-        buffer_capacity=cfg.training.online_buffer_capacity,
+        buffer_capacity=cfg.training.online_buffer_capacity if not cfg.resume else None,
         fps=FPS,  # online_env.unwrapped.metadata["render_fps"],
         delta_timestamps=cfg.training.delta_timestamps,
     )
 
     if not cfg.resume and cfg.training.do_seed_online_buffer_with_offline_data:
         for k in online_dataset._data:
-            if k == OnlineBuffer.NEXT_INDEX_KEY:
-                online_dataset._data[k] = len(offline_dataset_cache)
+            if k == DataBuffer.NEXT_INDEX_KEY:
+                online_dataset._data[k][0] = len(offline_dataset_for_dataloader)
             else:
-                fill = offline_dataset_cache._data[k]
-                online_dataset._data[k][: len(fill)] = offline_dataset_cache._data[k]
+                fill = offline_dataset_for_dataloader.get_data_by_key(k)
+                online_dataset._data[k][: len(fill)] = offline_dataset_for_dataloader.get_data_by_key(k)
 
     # If we are doing online rollouts asynchronously, deepcopy the policy to use for online rollouts (this
     # makes it possible to do online rollouts in parallel with training updates).
     online_rollout_policy = deepcopy(policy) if cfg.training.do_online_rollout_async else policy
 
     # Create dataloader for online training.
-    concat_dataset = torch.utils.data.ConcatDataset([offline_dataset, online_dataset])
+    concat_dataset = torch.utils.data.ConcatDataset([offline_dataset_for_dataloader, online_dataset])
     sampler_weights = compute_sampler_weights(
-        offline_dataset,
+        offline_dataset_for_dataloader,
         offline_drop_n_last_frames=cfg.training.get("drop_n_last_frames", 0),
         online_dataset=online_dataset,
         # +1 because online rollouts return an extra frame for the "final observation". Note: we don't have
@@ -679,7 +599,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                     n_action_buffer=2,
                     warmup_time_s=1,
                     use_relative_actions=True,
-                    max_steps=200,
+                    max_steps=100,
                     visualize_img=True,
                     visualize_3d=False,
                 )
@@ -700,15 +620,14 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
             with lock:
                 start_update_buffer_time = time.perf_counter()
-                online_dataset.add_data(eval_info["episodes"])
-                online_dataset.flush()
+                online_dataset.add_episodes(eval_info["episodes"])
 
                 # Update the concatenated dataset length used during sampling.
                 concat_dataset.cumulative_sizes = concat_dataset.cumsum(concat_dataset.datasets)
 
                 # Update the sampling weights.
                 sampler.weights = compute_sampler_weights(
-                    offline_dataset,
+                    offline_dataset_for_dataloader,
                     offline_drop_n_last_frames=cfg.training.get("drop_n_last_frames", 0),
                     online_dataset=online_dataset,
                     # +1 because online rollouts return an extra frame for the "final observation". Note: we don't have

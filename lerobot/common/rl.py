@@ -4,7 +4,7 @@ import torch
 
 from lerobot.common.kinematics import KochKinematics
 from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
-from lerobot.common.robot_devices.robots.koch import KochRobot
+from lerobot.common.robot_devices.robots.manipulator import ManipulatorRobot
 from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.vision import segment_hsv
 
@@ -141,7 +141,7 @@ def _go_to_pos(robot, pos, tol=None):
             break
 
 
-def reset_for_joint_pos(robot: KochRobot):
+def reset_for_joint_pos(robot: ManipulatorRobot):
     robot.follower_arms["main"].write("Torque_Enable", TorqueMode.ENABLED.value)
     reset_pos = robot.follower_arms["main"].read("Present_Position")
     while True:
@@ -158,15 +158,15 @@ def reset_for_joint_pos(robot: KochRobot):
     _go_to_pos(robot, reset_pos)
 
 
-def reset_for_cube_push(robot: KochRobot, right=True):
+def reset_for_cube_push(robot: ManipulatorRobot, right=True):
     robot.follower_arms["main"].write("Torque_Enable", TorqueMode.ENABLED.value)
     staging_pos = torch.tensor([90, 100, 60, 65, 3, 30]).float()
     while True:
         reset_pos = torch.tensor(
             [
                 np.random.uniform(125, 135) if right else np.random.uniform(45, 55),
-                np.random.uniform(62, 66),
-                np.random.uniform(64, 66),
+                np.random.uniform(54, 58),
+                np.random.uniform(50, 52),
                 np.random.uniform(78, 98),
                 np.random.uniform(-41, -31) if right else np.random.uniform(31, 41),
                 np.random.uniform(0, 20),
@@ -178,6 +178,8 @@ def reset_for_cube_push(robot: KochRobot, right=True):
         ):
             break
     intermediate_pos = torch.from_numpy(robot.follower_arms["main"].read("Present_Position"))
+    intermediate_pos[1] = staging_pos[1]
+    _go_to_pos(robot, intermediate_pos, tol=np.array([5, 5, 5, 10, 5, 5]))
     intermediate_pos[1:] = staging_pos[1:]
     _go_to_pos(robot, intermediate_pos, tol=np.array([5, 5, 5, 10, 5, 5]))
     if right and staging_pos[0] > intermediate_pos[0]:  # noqa: SIM114
