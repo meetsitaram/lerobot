@@ -156,7 +156,7 @@ class PolicyRolloutWrapper:
         if inference_time > (self.n_action_buffer * self.period_us + self.period_us) / MICROSEC:
             logging.warning(
                 "Inference is taking longer than your buffer.\n"
-                f"  Buffer time   : {self.n_action_buffer * self.period_us + self.period_us / 1000=} ms\n"
+                f"  Buffer time   : {(self.n_action_buffer * self.period_us + self.period_us) / 1000:.0f} ms\n"
                 f"  Inference time: {inference_time * 1000 :.0f} ms"
             )
 

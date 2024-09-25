@@ -560,7 +560,7 @@ if __name__ == "__main__":
             warmup_time_s=args.warmup_time_s,
             use_relative_actions=args.use_relative_actions,
             max_steps=args.max_steps,
-            visualize=args.visualize,
+            visualize_img=args.visualize,
             enable_progbar=True,
         )
         pprint(eval_info["aggregated"])

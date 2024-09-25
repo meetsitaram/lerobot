@@ -16,6 +16,7 @@
 """A data buffer for efficient data management during offline and online training."""
 
 import json
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -475,13 +476,21 @@ class DataBuffer(torch.utils.data.Dataset):
                 is_pad = min_ > self.tolerance_s
 
                 # Check violated query timestamps are all outside the episode range.
-                if not (
-                    (query_ts[is_pad] < episode_timestamps[0]) | (episode_timestamps[-1] < query_ts[is_pad])
-                ).all():
-                    raise TimestampOutsideToleranceError(
+                try:
+                    if not (
+                        (query_ts[is_pad] < episode_timestamps[0])
+                        | (episode_timestamps[-1] < query_ts[is_pad])
+                    ).all():
+                        raise TimestampOutsideToleranceError(
+                            f"One or several timestamps unexpectedly violate the tolerance ({min_} > "
+                            f"{self.tolerance_s=}) inside the episode range."
+                        )
+                except TimestampOutsideToleranceError:
+                    logging.warning(
                         f"One or several timestamps unexpectedly violate the tolerance ({min_} > "
                         f"{self.tolerance_s=}) inside the episode range."
                     )
+                    return self.__getitem__(np.random.choice(len(self)))
 
                 if self.is_video_dataset and data_key.startswith(self.IMAGE_KEY_PREFIX):
                     video_delta_timestamps[data_key] = self._data[self.TIMESTAMP_KEY][
