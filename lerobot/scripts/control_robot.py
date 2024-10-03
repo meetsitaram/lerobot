@@ -99,8 +99,6 @@ python lerobot/scripts/control_robot.py record \
 """
 
 import argparse
-import concurrent.futures
-import json
 import logging
 import os
 import platform
@@ -110,6 +108,7 @@ import traceback
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import cache
+from itertools import chain
 from pathlib import Path
 
 import cv2
@@ -121,12 +120,7 @@ from PIL import Image
 from termcolor import colored
 
 # from safetensors.torch import load_file, save_file
-from lerobot.common.datasets.compute_stats import compute_stats
-from lerobot.common.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
-from lerobot.common.datasets.push_dataset_to_hub.aloha_hdf5_format import to_hf_dataset
-from lerobot.common.datasets.push_dataset_to_hub.utils import concatenate_episodes, get_default_encoding
-from lerobot.common.datasets.utils import calculate_episode_data_index, create_branch
-from lerobot.common.datasets.video_utils import encode_video_frames
+from lerobot.common.datasets.online_buffer import LeRobotDatasetV2
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.rl import calc_reward_cube_push
 from lerobot.common.robot_devices.robots.factory import make_robot
@@ -135,12 +129,6 @@ from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
 from lerobot.common.vision import GoalSetter
 from lerobot.scripts.eval import get_pretrained_policy_path
-from lerobot.scripts.push_dataset_to_hub import (
-    push_dataset_card_to_hub,
-    push_meta_data_to_hub,
-    push_videos_to_hub,
-    save_meta_data,
-)
 
 ########################################################################################
 # Utilities
@@ -150,19 +138,15 @@ from lerobot.scripts.push_dataset_to_hub import (
 def say(text, blocking=False):
     # Check if mac, linux, or windows.
     if platform.system() == "Darwin":
-        cmd = f'say "{text}"'
+        cmd = f'say "{text}"{"" if blocking else " &"}'
     elif platform.system() == "Linux":
-        cmd = f'spd-say "{text}"'
+        cmd = f'spd-say "{text}"{" --wait" if blocking else ""}'
     elif platform.system() == "Windows":
+        # TODO(rcadene): Make blocking option work for Windows
         cmd = (
             'PowerShell -Command "Add-Type -AssemblyName System.Speech; '
             f"(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{text}')\""
         )
-
-    if not blocking and platform.system() in ["Darwin", "Linux"]:
-        # TODO(rcadene): Make it work for Windows
-        # Use the ampersand to run command in the background
-        cmd += " &"
 
     os.system(cmd)
 
@@ -347,20 +331,7 @@ def record(
     if local_dir.exists() and force_override:
         shutil.rmtree(local_dir)
 
-    episodes_dir = local_dir / "episodes"
-    episodes_dir.mkdir(parents=True, exist_ok=True)
-
-    videos_dir = local_dir / "videos"
-    videos_dir.mkdir(parents=True, exist_ok=True)
-
-    # Logic to resume data recording
-    rec_info_path = episodes_dir / "data_recording_info.json"
-    if rec_info_path.exists():
-        with open(rec_info_path) as f:
-            rec_info = json.load(f)
-        episode_index = rec_info["last_episode_index"] + 1
-    else:
-        episode_index = 0
+    dataset = LeRobotDatasetV2(repo_id, fps=fps)
 
     if is_headless():
         logging.info(
@@ -421,7 +392,7 @@ def record(
     while timestamp < warmup_time_s:
         if not is_warmup_print:
             logging.info("Warming up (no data recording)")
-            say("Warming up")
+            say("Warming up", blocking=True)
             is_warmup_print = True
 
         start_loop_t = time.perf_counter()
@@ -445,218 +416,172 @@ def record(
 
         timestamp = time.perf_counter() - start_warmup_t
 
-    goal_setter = GoalSetter.from_mask_file("outputs/goal_mask.npy")
-    goal_mask = goal_setter.get_goal_mask()
-    where_goal = np.where(goal_mask > 0)
-    # Save images using threads to reach high fps (30 and more)
-    # Using `with` to exist smoothly if an execption is raised.
-    futures = []
-    num_image_writers = num_image_writers_per_camera * len(robot.cameras)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_image_writers) as executor:
-        # Start recording all episodes
-        while episode_index < num_episodes:
-            logging.info(f"Recording episode {episode_index}")
-            say(f"Recording episode {episode_index}")
-            ep_dict = defaultdict(list)
-            frame_index = 0
-            timestamp = 0
-            start_episode_t = time.perf_counter()
-            prior_relative_action = None
-            while timestamp < episode_time_s:
-                start_loop_t = time.perf_counter()
+    # Start recording all episodes
+    while (
+        episode_index := (dataset.get_unique_episode_indices()[-1] + 1) if len(dataset) > 0 else 0
+    ) < num_episodes:
+        logging.info(f"Recording episode {episode_index}")
+        say(f"Recording episode {episode_index}", blocking=True)
 
-                if policy is None:
-                    observation, action = robot.teleop_step(record_data=True)
-                else:
-                    observation = robot.capture_observation()
+        direction = "left" if episode_index % 2 == 0 else "right"
+        goal_setter = GoalSetter.from_mask_file(f"outputs/goal_mask_{direction}.npy")
+        say(f"Go {direction}", blocking=True)
+        goal_mask = goal_setter.get_goal_mask()
+        where_goal = np.where(goal_mask > 0)
 
-                image_keys = [key for key in observation if "image" in key]
-                not_image_keys = [key for key in observation if "image" not in key]
+        ep_dict = defaultdict(list)
+        frame_index = 0
+        timestamp = 0
+        start_episode_t = time.perf_counter()
+        prior_relative_action = None
+        while timestamp < episode_time_s:
+            start_loop_t = time.perf_counter()
 
+            if policy is None:
+                observation, action = robot.teleop_step(record_data=True)
+            else:
+                observation = robot.capture_observation()
+
+            image_keys = [k for k in observation if k.startswith(LeRobotDatasetV2.IMAGE_KEY_PREFIX)]
+
+            if not is_headless():
                 for key in image_keys:
-                    futures += [
-                        executor.submit(
-                            save_image, observation[key], key, frame_index, episode_index, videos_dir
-                        )
-                    ]
+                    this_relative_action = (action["action"] - observation["observation.state"]).numpy()
+                    reward, success, do_terminate, info = calc_reward_cube_push(
+                        img=observation[key].numpy(),
+                        goal_mask=goal_mask,
+                        current_joint_pos=observation["observation.state"].numpy(),
+                        action=this_relative_action,
+                        prior_action=prior_relative_action,
+                    )
+                    prior_relative_action = this_relative_action.copy()
+                    annotated_img = info["annotated_img"]
+                    annotated_img[where_goal] = (
+                        annotated_img[where_goal]
+                        - (annotated_img[where_goal] - np.array([255, 255, 255])) // 2
+                    )
+                    annotated_img = cv2.resize(annotated_img, (640, 480))
+                    cv2.putText(
+                        annotated_img,
+                        org=(10, 25),
+                        color=(255, 255, 255),
+                        text=f"{reward=:.3f}",
+                        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                        fontScale=1,
+                        thickness=1,
+                    )
+                    cv2.imshow(key, cv2.cvtColor(annotated_img, cv2.COLOR_RGB2BGR))
+                    ep_dict["next.reward"].append(reward.astype(np.float32))
+                    ep_dict["next.success"].append(success)
+                    observation[key][where_goal] = observation[key][where_goal] // 2 + torch.tensor(
+                        [127, 127, 127], dtype=observation[key].dtype
+                    )
+                    if success:
+                        say("Goal accomplished.", blocking=True)
+                        exit_early = True
+                    elif do_terminate:
+                        say("Failed.", blocking=True)
+                        exit_early = True
+                cv2.waitKey(1)
 
-                if not is_headless():
-                    image_keys = [key for key in observation if "image" in key]
-                    for key in image_keys:
-                        this_relative_action = (action["action"] - observation["observation.state"]).numpy()
-                        reward, success, do_terminate, info = calc_reward_cube_push(
-                            img=observation[key].numpy(),
-                            goal_mask=goal_mask,
-                            current_joint_pos=observation["observation.state"].numpy(),
-                            action=this_relative_action,
-                            prior_action=prior_relative_action,
-                        )
-                        prior_relative_action = this_relative_action.copy()
-                        annotated_img = info["annotated_img"]
-                        annotated_img[where_goal] = (
-                            annotated_img[where_goal]
-                            - (annotated_img[where_goal] - np.array([255, 255, 255])) // 2
-                        )
-                        annotated_img = cv2.resize(annotated_img, (640, 480))
-                        cv2.putText(
-                            annotated_img,
-                            org=(10, 25),
-                            color=(255, 255, 255),
-                            text=f"{reward=:.3f}",
-                            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                            fontScale=1,
-                            thickness=1,
-                        )
-                        cv2.imshow(key, cv2.cvtColor(annotated_img, cv2.COLOR_RGB2BGR))
-                        ep_dict["next.reward"].append(reward)
-                        ep_dict["next.success"].append(success)
-                        if success:
-                            say("Goal accomplished.", blocking=True)
-                            exit_early = True
-                        elif do_terminate:
-                            say("Failed.", blocking=True)
-                            exit_early = True
-                    cv2.waitKey(1)
+            for key in observation:
+                ep_dict[key].append(observation[key].numpy())
 
-                for key in not_image_keys:
-                    if key not in ep_dict:
-                        ep_dict[key] = []
-                    ep_dict[key].append(observation[key])
+            if policy is not None:
+                with (
+                    torch.inference_mode(),
+                    torch.autocast(device_type=device.type)
+                    if device.type == "cuda" and hydra_cfg.use_amp
+                    else nullcontext(),
+                ):
+                    # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
+                    for name in observation:
+                        if "image" in name:
+                            observation[name] = observation[name].type(torch.float32) / 255
+                            observation[name] = observation[name].permute(2, 0, 1).contiguous()
+                        observation[name] = observation[name].unsqueeze(0)
+                        observation[name] = observation[name].to(device)
 
-                if policy is not None:
-                    with (
-                        torch.inference_mode(),
-                        torch.autocast(device_type=device.type)
-                        if device.type == "cuda" and hydra_cfg.use_amp
-                        else nullcontext(),
-                    ):
-                        # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
-                        for name in observation:
-                            if "image" in name:
-                                observation[name] = observation[name].type(torch.float32) / 255
-                                observation[name] = observation[name].permute(2, 0, 1).contiguous()
-                            observation[name] = observation[name].unsqueeze(0)
-                            observation[name] = observation[name].to(device)
+                    # Compute the next action with the policy
+                    # based on the current observation
+                    action = policy.select_action(observation)
 
-                        # Compute the next action with the policy
-                        # based on the current observation
-                        action = policy.select_action(observation)
+                    # Remove batch dimension
+                    action = action.squeeze(0)
 
-                        # Remove batch dimension
-                        action = action.squeeze(0)
+                    # Move to cpu, if not already the case
+                    action = action.to("cpu")
 
-                        # Move to cpu, if not already the case
-                        action = action.to("cpu")
+                # Order the robot to move
+                action_sent = robot.send_action(action)
 
-                    # Order the robot to move
-                    action_sent = robot.send_action(action)
+                # Action can eventually be clipped using `max_relative_target`,
+                # so action actually sent is saved in the dataset.
+                action = {"action": action_sent}
 
-                    # Action can eventually be clipped using `max_relative_target`,
-                    # so action actually sent is saved in the dataset.
-                    action = {"action": action_sent}
+            for key in action:
+                ep_dict[key].append(action[key].numpy().astype(np.float32))
 
-                for key in action:
-                    if key not in ep_dict:
-                        ep_dict[key] = []
-                    ep_dict[key].append(action[key])
+            frame_index += 1
 
-                frame_index += 1
+            dt_s = time.perf_counter() - start_loop_t
+            busy_wait(1 / fps - dt_s)
 
-                dt_s = time.perf_counter() - start_loop_t
-                busy_wait(1 / fps - dt_s)
+            dt_s = time.perf_counter() - start_loop_t
+            log_control_info(robot, dt_s, fps=fps)
 
-                dt_s = time.perf_counter() - start_loop_t
-                log_control_info(robot, dt_s, fps=fps)
+            timestamp = time.perf_counter() - start_episode_t
+            if exit_early:
+                exit_early = False
+                break
 
-                timestamp = time.perf_counter() - start_episode_t
+        if not stop_recording:
+            logging.info("Reset the environment")
+            say("Reset the environment")
+            while not exit_early:
+                start = time.perf_counter()
+                robot.teleop_step()
+                busy_wait(1 / fps - (time.perf_counter() - start))
                 if exit_early:
                     exit_early = False
                     break
 
-            if not stop_recording:
-                # Start resetting env while the executor are finishing
-                logging.info("Reset the environment")
-                say("Reset the environment")
-                while not exit_early:
-                    start = time.perf_counter()
-                    robot.teleop_step()
-                    busy_wait(1 / fps - (time.perf_counter() - start))
-                    if exit_early:
-                        exit_early = False
-                        break
+        if rerecord_episode:
+            say("Re-recording the last episode.")
+            rerecord_episode = False
+            continue
 
-            timestamp = 0
-            start_vencod_t = time.perf_counter()
+        # Compile episode data and add to episode dictionary.
+        num_frames = frame_index
+        ep_dict[LeRobotDatasetV2.EPISODE_INDEX_KEY] = np.full((num_frames,), episode_index, dtype=int)
+        ep_dict[LeRobotDatasetV2.INDEX_KEY] = np.arange(num_frames)
+        ep_dict[LeRobotDatasetV2.FRAME_INDEX_KEY] = np.arange(num_frames)
+        ep_dict[LeRobotDatasetV2.TIMESTAMP_KEY] = np.arange(num_frames, dtype=np.float32) / fps
+        for k in chain(action, observation, ["next.reward"]):
+            ep_dict[k] = np.stack(ep_dict[k])
+            if not k.startswith(LeRobotDatasetV2.IMAGE_KEY_PREFIX):
+                ep_dict[k] = ep_dict[k].astype(np.float32)
+        ep_dict["next.success"] = np.array(ep_dict["next.success"])
+        done = np.zeros(num_frames, dtype=bool)
+        done[-1] = True
+        ep_dict["next.done"] = done
+        dataset.add_episodes(ep_dict)
 
-            # During env reset we save the data and encode the videos
-            num_frames = frame_index
+        is_last_episode = stop_recording or len(dataset.get_unique_episode_indices()) == num_episodes
 
-            for key in image_keys:
-                tmp_imgs_dir = videos_dir / f"{key}_episode_{episode_index:06d}"
-                fname = f"{key}_episode_{episode_index:06d}.mp4"
-                video_path = local_dir / "videos" / fname
-                if video_path.exists():
-                    video_path.unlink()
-                # Store the reference to the video frame, even tho the videos are not yet encoded
-                ep_dict[key] = []
-                for i in range(num_frames):
-                    ep_dict[key].append({"path": f"videos/{fname}", "timestamp": i / fps})
+        # Wait if necessary
+        if not is_last_episode:
+            for _ in tqdm.trange(reset_time_s, desc="Waiting"):
+                time.sleep(1)
+                if exit_early:
+                    exit_early = False
+                    break
 
-            for key in not_image_keys:
-                ep_dict[key] = torch.stack(ep_dict[key])
-
-            for key in action:
-                ep_dict[key] = torch.stack(ep_dict[key])
-
-            ep_dict["episode_index"] = torch.tensor([episode_index] * num_frames)
-            ep_dict["frame_index"] = torch.arange(0, num_frames, 1)
-            ep_dict["timestamp"] = torch.arange(0, num_frames, 1) / fps
-
-            done = torch.zeros(num_frames, dtype=torch.bool)
-            done[-1] = True
-            ep_dict["next.done"] = done
-
-            ep_path = episodes_dir / f"episode_{episode_index}.pth"
-            print("Saving episode dictionary...")
-            torch.save(ep_dict, ep_path)
-
-            rec_info = {
-                "last_episode_index": episode_index,
-            }
-            with open(rec_info_path, "w") as f:
-                json.dump(rec_info, f)
-
-            is_last_episode = stop_recording or (episode_index == (num_episodes - 1))
-
-            # Wait if necessary
-            with tqdm.tqdm(total=reset_time_s, desc="Waiting") as pbar:
-                while timestamp < reset_time_s and not is_last_episode:
-                    time.sleep(1)
-                    timestamp = time.perf_counter() - start_vencod_t
-                    pbar.update(1)
-                    if exit_early:
-                        exit_early = False
-                        break
-
-            # Skip updating episode index which forces re-recording episode
-            if rerecord_episode:
-                rerecord_episode = False
-                continue
-
-            episode_index += 1
-
-            if is_last_episode:
-                logging.info("Done recording")
-                say("Done recording", blocking=True)
-                if not is_headless():
-                    listener.stop()
-
-                logging.info("Waiting for threads writing the images on disk to terminate...")
-                for _ in tqdm.tqdm(
-                    concurrent.futures.as_completed(futures), total=len(futures), desc="Writting images"
-                ):
-                    pass
-                break
+        if is_last_episode:
+            logging.info("Done recording")
+            say("Done recording", blocking=True)
+            if not is_headless():
+                listener.stop()
 
     robot.disconnect()
     if not is_headless():
@@ -664,105 +589,42 @@ def record(
 
     num_episodes = episode_index
 
-    logging.info("Encoding videos")
-    say("Encoding videos")
-    # Use ffmpeg to convert frames stored as png into mp4 videos
-    for episode_index in tqdm.tqdm(range(num_episodes)):
-        for key in image_keys:
-            tmp_imgs_dir = videos_dir / f"{key}_episode_{episode_index:06d}"
-            fname = f"{key}_episode_{episode_index:06d}.mp4"
-            video_path = local_dir / "videos" / fname
-            if video_path.exists():
-                # Skip if video is already encoded. Could be the case when resuming data recording.
-                continue
-            # note: `encode_video_frames` is a blocking call. Making it asynchronous shouldn't speedup encoding,
-            # since video encoding with ffmpeg is already using multithreading.
-            encode_video_frames(tmp_imgs_dir, video_path, fps, overwrite=True)
-            shutil.rmtree(tmp_imgs_dir)
-
-    logging.info("Concatenating episodes")
-    ep_dicts = []
-    for episode_index in tqdm.tqdm(range(num_episodes)):
-        ep_path = episodes_dir / f"episode_{episode_index}.pth"
-        ep_dict = torch.load(ep_path)
-        ep_dicts.append(ep_dict)
-    data_dict = concatenate_episodes(ep_dicts)
-
-    total_frames = data_dict["frame_index"].shape[0]
-    data_dict["index"] = torch.arange(0, total_frames, 1)
-
-    hf_dataset = to_hf_dataset(data_dict, video)
-    episode_data_index = calculate_episode_data_index(hf_dataset)
-    info = {
-        "codebase_version": CODEBASE_VERSION,
-        "fps": fps,
-        "video": video,
-    }
-    if video:
-        info["encoding"] = get_default_encoding()
-
-    lerobot_dataset = LeRobotDataset.from_preloaded(
-        repo_id=repo_id,
-        hf_dataset=hf_dataset,
-        episode_data_index=episode_data_index,
-        info=info,
-        videos_dir=videos_dir,
-    )
-    if run_compute_stats:
-        logging.info("Computing dataset statistics")
-        say("Computing dataset statistics")
-        stats = compute_stats(lerobot_dataset)
-        lerobot_dataset.stats = stats
-    else:
-        stats = {}
-        logging.info("Skipping computation of the dataset statistics")
-
-    hf_dataset = hf_dataset.with_format(None)  # to remove transforms that cant be saved
-    hf_dataset.save_to_disk(str(local_dir / "train"))
-
-    meta_data_dir = local_dir / "meta_data"
-    save_meta_data(info, stats, episode_data_index, meta_data_dir)
-
     if push_to_hub:
-        hf_dataset.push_to_hub(repo_id, revision="main")
-        push_meta_data_to_hub(repo_id, meta_data_dir, revision="main")
-        push_dataset_card_to_hub(repo_id, revision="main", tags=tags)
-        if video:
-            push_videos_to_hub(repo_id, videos_dir, revision="main")
-        create_branch(repo_id, repo_type="dataset", branch=CODEBASE_VERSION)
+        # TODO(now)
+        pass
 
     logging.info("Exiting")
-    say("Exiting")
-    return lerobot_dataset
+    say("Exiting", blocking=True)
+    return dataset
 
 
-def replay(robot: Robot, episode: int, fps: int | None = None, root="data", repo_id="lerobot/debug"):
-    # TODO(rcadene): Add option to record logs
-    local_dir = Path(root) / repo_id
-    if not local_dir.exists():
-        raise ValueError(local_dir)
+# def replay(robot: Robot, episode: int, fps: int | None = None, root="data", repo_id="lerobot/debug"):
+#     # TODO(rcadene): Add option to record logs
+#     local_dir = Path(root) / repo_id
+#     if not local_dir.exists():
+#         raise ValueError(local_dir)
 
-    dataset = LeRobotDataset(repo_id, root=root)
-    items = dataset.hf_dataset.select_columns("action")
-    from_idx = dataset.episode_data_index["from"][episode].item()
-    to_idx = dataset.episode_data_index["to"][episode].item()
+#     dataset = LeRobotDataset(repo_id, root=root)
+#     items = dataset.hf_dataset.select_columns("action")
+#     from_idx = dataset.episode_data_index["from"][episode].item()
+#     to_idx = dataset.episode_data_index["to"][episode].item()
 
-    if not robot.is_connected:
-        robot.connect()
+#     if not robot.is_connected:
+#         robot.connect()
 
-    logging.info("Replaying episode")
-    say("Replaying episode", blocking=True)
-    for idx in range(from_idx, to_idx):
-        start_episode_t = time.perf_counter()
+#     logging.info("Replaying episode")
+#     say("Replaying episode", blocking=True)
+#     for idx in range(from_idx, to_idx):
+#         start_episode_t = time.perf_counter()
 
-        action = items[idx]["action"]
-        robot.send_action(action)
+#         action = items[idx]["action"]
+#         robot.send_action(action)
 
-        dt_s = time.perf_counter() - start_episode_t
-        busy_wait(1 / fps - dt_s)
+#         dt_s = time.perf_counter() - start_episode_t
+#         busy_wait(1 / fps - dt_s)
 
-        dt_s = time.perf_counter() - start_episode_t
-        log_control_info(robot, dt_s, fps=fps)
+#         dt_s = time.perf_counter() - start_episode_t
+#         log_control_info(robot, dt_s, fps=fps)
 
 
 if __name__ == "__main__":
@@ -937,7 +799,9 @@ if __name__ == "__main__":
             record(robot, **kwargs)
 
     elif control_mode == "replay":
-        replay(robot, **kwargs)
+        # TODO(now)
+        raise AssertionError
+        # replay(robot, **kwargs)
 
     if robot.is_connected:
         # Disconnect manually to avoid a "Core dump" during process

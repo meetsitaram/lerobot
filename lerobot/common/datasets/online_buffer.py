@@ -341,7 +341,13 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
         return np.count_nonzero(self._data[self.OCCUPANCY_MASK_KEY])
 
     def get_unique_episode_indices(self) -> np.ndarray:
-        return np.unique(self._data[self.EPISODE_INDEX_KEY][self._data[self.OCCUPANCY_MASK_KEY]])
+        """
+        Return (sorted) unique episode indices from the dataset, or an empty array if the dataset is empty.
+        """
+        if len(self) > 0:
+            return np.sort(np.unique(self._data[self.EPISODE_INDEX_KEY][self._data[self.OCCUPANCY_MASK_KEY]]))
+        else:
+            return np.empty(shape=(0,), dtype=int)
 
     def _infer_image_modes(self) -> list[LeRobotDatasetV2ImageMode]:
         """Infer which image modes are available according to what is in the storage directory"""
@@ -1294,13 +1300,13 @@ def compute_sampler_weights(
 
     if len(offline_dataset) > 0:
         offline_data_mask_indices = []
-        for start_index, end_index in zip(
-            offline_dataset.episode_data_index["from"],
-            offline_dataset.episode_data_index["to"],
-            strict=True,
-        ):
+        episode_indices = offline_dataset.get_data_by_key(LeRobotDatasetV2.EPISODE_INDEX_KEY)
+        for episode_idx in np.unique(episode_indices):
+            where_episode = np.where(episode_indices == episode_idx)
+            start_index = where_episode[0][0]
+            end_index = where_episode[0][-1] + 1
             offline_data_mask_indices.extend(
-                range(start_index.item(), end_index.item() - offline_drop_n_last_frames)
+                range(start_index.item(), end_index.item() - online_drop_n_last_frames)
             )
         offline_data_mask = torch.zeros(len(offline_dataset), dtype=torch.bool)
         offline_data_mask[torch.tensor(offline_data_mask_indices)] = True

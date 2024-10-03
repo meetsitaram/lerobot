@@ -34,4 +34,4 @@ cameras:
     height: 120
 # max_relative_target: [10, 15, 15, 30, 30, 20]
 max_relative_target: [5, 8, 10, 10, 12, 5]
-gripper_open_degree: 30
+gripper_open_degree: 10
