@@ -490,8 +490,6 @@ def record(
                             current_joint_pos=observation["observation.state"].numpy(),
                             action=this_relative_action,
                             prior_action=prior_relative_action,
-                            first_order_smoothness_coeff=0,
-                            second_order_smoothness_coeff=-0.02,
                         )
                         prior_relative_action = this_relative_action.copy()
                         annotated_img = info["annotated_img"]

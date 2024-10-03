@@ -44,7 +44,6 @@ class Policy(Protocol):
             dataset_stats: Dataset statistics to be used for normalization.
         """
 
-    @property
     def n_obs_steps(self) -> int:
         """TODO(now)"""
 

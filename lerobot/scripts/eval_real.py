@@ -166,17 +166,8 @@ def rollout(
                     current_joint_pos=observation["observation.state"].numpy(),
                     action=episode_data["action"][-1],
                     prior_action=prior_action,
-                    first_order_smoothness_coeff=0,
-                    second_order_smoothness_coeff=-0.02,
                 )
                 annotated_img = info["annotated_img"]
-                # reward, success, do_terminate = calc_reward_joint_goal(
-                #     observation["observation.state"].numpy(),
-                #     episode_data["action"][-1],
-                #     prior_action,
-                #     first_order_smoothness_coeff=0,
-                #     second_order_smoothness_coeff=-0.04,
-                # )
                 print("REWARD:", reward, ", SUCCESS:", success)
                 episode_data["next.reward"].append(reward)
                 episode_data["next.success"].append(success)
