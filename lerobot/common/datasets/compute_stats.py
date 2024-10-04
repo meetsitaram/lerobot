@@ -19,9 +19,6 @@ from math import ceil
 import einops
 import torch
 import tqdm
-from datasets import Image
-
-from lerobot.common.datasets.video_utils import VideoFrame
 
 
 def get_stats_einops_patterns(dataset, num_workers=0):
@@ -39,7 +36,7 @@ def get_stats_einops_patterns(dataset, num_workers=0):
     batch = next(iter(dataloader))
 
     stats_patterns = {}
-    for key, feats_type in dataset.features.items():
+    for key in dataset.data_keys:
         # NOTE: skip language_instruction embedding in stats computation
         if key == "language_instruction":
             continue
@@ -47,7 +44,7 @@ def get_stats_einops_patterns(dataset, num_workers=0):
         # sanity check that tensors are not float64
         assert batch[key].dtype != torch.float64
 
-        if isinstance(feats_type, (VideoFrame, Image)):
+        if key.startswith("observation.image"):
             # sanity check that images are channel first
             _, c, h, w = batch[key].shape
             assert c < h and c < w, f"expect channel first images, but instead {batch[key].shape}"
@@ -63,7 +60,7 @@ def get_stats_einops_patterns(dataset, num_workers=0):
         elif batch[key].ndim == 1:
             stats_patterns[key] = "b -> 1"
         else:
-            raise ValueError(f"{key}, {feats_type}, {batch[key].shape}")
+            raise ValueError(f"{key}, {batch[key].shape}")
 
     return stats_patterns
 

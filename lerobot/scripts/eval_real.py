@@ -62,6 +62,7 @@ def rollout(
     max_steps: int | None = None,
     visualize_img: bool = False,
     visualize_3d: bool = False,
+    enable_intevention: bool = False,
 ) -> dict:
     goal_setter_left = GoalSetter.from_mask_file("outputs/goal_mask_left.npy")
     goal_setter_right = GoalSetter.from_mask_file("outputs/goal_mask_right.npy")
@@ -120,7 +121,8 @@ def rollout(
 
     episode_data = defaultdict(list)
 
-    ps5_controller = PS5Controller()
+    if enable_intevention:
+        ps5_controller = PS5Controller()
 
     period = 1 / fps
     to_visualize = {}
@@ -293,21 +295,22 @@ def rollout(
             robot.send_action(absolute_action)
             logging.info("Warming up.")
         else:
-            ps5_reference_joint_pos = (
-                prior_absolute_action.numpy() if prior_absolute_action is not None else first_follower_pos
-            )
-            ps5_action = ps5_controller.read(ps5_reference_joint_pos.copy())  # absolute
-            if ps5_controller.check_flag():
-                surrender_control = False
-            if ps5_action is not None or surrender_control:
-                surrender_control = True
-                if ps5_action is None:
-                    ps5_action = ps5_reference_joint_pos.copy()
-                action = (
-                    torch.from_numpy(ps5_action - follower_pos)
-                    if use_relative_actions
-                    else torch.from_numpy(ps5_action)
+            if enable_intevention:
+                ps5_reference_joint_pos = (
+                    prior_absolute_action.numpy() if prior_absolute_action is not None else first_follower_pos
                 )
+                ps5_action = ps5_controller.read(ps5_reference_joint_pos.copy())  # absolute
+                if ps5_controller.check_flag():
+                    surrender_control = False
+                if ps5_action is not None or surrender_control:
+                    surrender_control = True
+                    if ps5_action is None:
+                        ps5_action = ps5_reference_joint_pos.copy()
+                    action = (
+                        torch.from_numpy(ps5_action - follower_pos)
+                        if use_relative_actions
+                        else torch.from_numpy(ps5_action)
+                    )
 
             if use_relative_actions:
                 relative_action = action
@@ -323,11 +326,6 @@ def rollout(
                 episode_data["action"].append(relative_action.numpy())
             else:
                 episode_data["action"].append(absolute_action.numpy())
-
-            # if ps5_action is not None or surrender_control:
-            #     episode_data["is_teleop_step"].append(True)
-            # else:
-            #     episode_data["is_teleop_step"].append(False)
 
         prior_absolute_action = absolute_action.clone()
 

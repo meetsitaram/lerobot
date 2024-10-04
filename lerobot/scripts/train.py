@@ -27,19 +27,20 @@ import torch
 import torch.utils
 from deepdiff import DeepDiff
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from safetensors.torch import load_file
 from termcolor import colored
 from torch import nn
 from torch.cuda.amp import GradScaler
 
-from lerobot.common.datasets.factory import make_dataset, resolve_delta_timestamps
-from lerobot.common.datasets.lerobot_dataset import MultiLeRobotDataset
+from lerobot.common.datasets.factory import resolve_delta_timestamps
+from lerobot.common.datasets.lerobot_dataset import DATA_DIR, MultiLeRobotDataset
 from lerobot.common.datasets.online_buffer import (
     LeRobotDatasetV2,
     LeRobotDatasetV2ImageMode,
     compute_sampler_weights,
 )
-from lerobot.common.datasets.sampler import EpisodeAwareSampler
-from lerobot.common.datasets.utils import cycle
+from lerobot.common.datasets.transforms import get_image_transforms
+from lerobot.common.datasets.utils import cycle, unflatten_dict
 from lerobot.common.envs.factory import make_env
 from lerobot.common.logger import Logger, log_output_dir
 from lerobot.common.policies.factory import make_policy
@@ -244,6 +245,8 @@ def log_eval_info(logger, info, step, cfg, dataset, is_online):
 
 
 def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
+    resolve_delta_timestamps(cfg)
+
     if out_dir is None:
         raise NotImplementedError()
     if job_name is None:
@@ -328,7 +331,38 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     torch.backends.cuda.matmul.allow_tf32 = True
 
     logging.info("make_dataset")
-    offline_dataset = make_dataset(cfg)
+    image_transforms = None
+    if cfg.training.image_transforms.enable:
+        cfg_tf = cfg.training.image_transforms
+        image_transforms = get_image_transforms(
+            brightness_weight=cfg_tf.brightness.weight,
+            brightness_min_max=cfg_tf.brightness.min_max,
+            contrast_weight=cfg_tf.contrast.weight,
+            contrast_min_max=cfg_tf.contrast.min_max,
+            saturation_weight=cfg_tf.saturation.weight,
+            saturation_min_max=cfg_tf.saturation.min_max,
+            hue_weight=cfg_tf.hue.weight,
+            hue_min_max=cfg_tf.hue.min_max,
+            sharpness_weight=cfg_tf.sharpness.weight,
+            sharpness_min_max=cfg_tf.sharpness.min_max,
+            max_num_transforms=cfg_tf.max_num_transforms,
+            random_order=cfg_tf.random_order,
+        )
+    offline_dataset = LeRobotDatasetV2(
+        DATA_DIR / cfg.dataset_repo_id,
+        delta_timestamps=cfg.training.delta_timestamps,
+        image_mode=LeRobotDatasetV2ImageMode(cfg.get("lerobot_dataset_v2_image_mode", "video")),
+        image_transform=image_transforms,
+    )
+    offline_dataset.switch_image_mode(LeRobotDatasetV2ImageMode.MEMMAP)
+    offline_dataset.stats = unflatten_dict(load_file(offline_dataset.storage_dir / "stats.safetensors"))
+    if cfg.get("override_dataset_stats", False):
+        for key, stats_dict in cfg.override_dataset_stats.items():
+            for stats_type, listconfig in stats_dict.items():
+                # example of stats_type: min, max, mean, std
+                stats = OmegaConf.to_container(listconfig, resolve=True)
+                offline_dataset.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+
     if isinstance(offline_dataset, MultiLeRobotDataset):
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
@@ -416,29 +450,21 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     # create dataloader for offline training
     if cfg.training.get("drop_n_last_frames"):
         shuffle = False
-        sampler = EpisodeAwareSampler(
-            offline_dataset.episode_data_index,
-            drop_n_last_frames=cfg.training.drop_n_last_frames,
-            shuffle=True,
+        sampler_weights = compute_sampler_weights(
+            offline_dataset,
+            offline_drop_n_last_frames=cfg.training.get("drop_n_last_frames", 0),
+        )
+        sampler = torch.utils.data.WeightedRandomSampler(
+            sampler_weights,
+            num_samples=len(offline_dataset),
+            replacement=True,
         )
     else:
         shuffle = True
         sampler = None
 
-    if cfg.get("use_lerobot_dataset_v2", False):
-        logging.info("Siphoning the dataset into a LeRobotDatasetV2.")
-        decode_images = cfg.get("lerobot_dataset_v2_decode_images", False)
-        offline_dataset_for_dataloader = LeRobotDatasetV2.from_huggingface_hub(
-            offline_dataset.repo_id,
-            delta_timestamps=offline_dataset.delta_timestamps,
-            decode_images=decode_images,
-            image_transform=offline_dataset.image_transforms,
-        )
-    else:
-        offline_dataset_for_dataloader = offline_dataset
-
     dataloader = torch.utils.data.DataLoader(
-        offline_dataset_for_dataloader,
+        offline_dataset,
         num_workers=cfg.training.num_workers,
         persistent_workers=cfg.training.num_workers > 0,
         batch_size=cfg.training.batch_size,
@@ -510,7 +536,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     online_dataset = LeRobotDatasetV2(
         online_buffer_path,
         buffer_capacity=cfg.training.online_buffer_capacity if not cfg.resume else None,
-        use_as_filo_buffer=True,
+        use_as_fifo_buffer=True,
         image_mode=LeRobotDatasetV2ImageMode.MEMMAP,
         fps=FPS,  # online_env.unwrapped.metadata["render_fps"],
         delta_timestamps=cfg.training.delta_timestamps,
@@ -519,19 +545,19 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     if not cfg.resume and cfg.training.do_seed_online_buffer_with_offline_data:
         for k in online_dataset._data:
             if k == LeRobotDatasetV2.NEXT_INDEX_KEY:
-                online_dataset._data[k][0] = len(offline_dataset_for_dataloader)
+                online_dataset._data[k][0] = len(offline_dataset)
             else:
-                fill = offline_dataset_for_dataloader.get_data_by_key(k)
-                online_dataset._data[k][: len(fill)] = offline_dataset_for_dataloader.get_data_by_key(k)
+                fill = offline_dataset.get_data_by_key(k)
+                online_dataset._data[k][: len(fill)] = offline_dataset.get_data_by_key(k)
 
     # If we are doing online rollouts asynchronously, deepcopy the policy to use for online rollouts (this
     # makes it possible to do online rollouts in parallel with training updates).
     online_rollout_policy = deepcopy(policy) if cfg.training.do_online_rollout_async else policy
 
     # Create dataloader for online training.
-    concat_dataset = torch.utils.data.ConcatDataset([offline_dataset_for_dataloader, online_dataset])
+    concat_dataset = torch.utils.data.ConcatDataset([offline_dataset, online_dataset])
     sampler_weights = compute_sampler_weights(
-        offline_dataset_for_dataloader,
+        offline_dataset,
         offline_drop_n_last_frames=cfg.training.get("drop_n_last_frames", 0),
         online_dataset=online_dataset,
         # +1 because online rollouts return an extra frame for the "final observation". Note: we don't have
@@ -619,7 +645,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
                 # Update the sampling weights.
                 sampler.weights = compute_sampler_weights(
-                    offline_dataset_for_dataloader,
+                    offline_dataset,
                     offline_drop_n_last_frames=cfg.training.get("drop_n_last_frames", 0),
                     online_dataset=online_dataset,
                     # +1 because online rollouts return an extra frame for the "final observation". Note: we don't have

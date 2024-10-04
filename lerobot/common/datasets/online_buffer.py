@@ -170,7 +170,7 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
     # Note: Other image modes could be used although if you can fit the buffer on disk, you should probably
     # stick to memmap mode.
     dataset = LeRobotDatasetV2(
-        "online_buffer", image_mode="memmap", buffer_capacity=10000, use_as_filo_buffer=True
+        "online_buffer", image_mode="memmap", buffer_capacity=10000, use_as_fifo_buffer=True
     )
     iter_dataloader = iter(torch.utils.data.DataLoader(dataset))
 
@@ -213,7 +213,7 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
         storage_dir: str | Path,
         fps: float | None = None,
         buffer_capacity: int | None = None,
-        use_as_filo_buffer: bool = False,
+        use_as_fifo_buffer: bool = False,
         image_mode: LeRobotDatasetV2ImageMode | str = LeRobotDatasetV2ImageMode.VIDEO,
         image_transform: Callable[[np.ndarray], np.ndarray] | None = None,
         delta_timestamps: dict[str, list[float]] | dict[str, np.ndarray] | None = None,
@@ -233,11 +233,11 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
                 added (doubling every time extra space is needed). If you know the number of frames you plan
                 to add in advance, it is recommended that this parameter be provided for efficiency. If
                 provided, attempts to add data beyond the capacity will result in an exception (unless
-                `use_as_filo_buffer` is set). If provided with an existing storage directory, the existing
+                `use_as_fifo_buffer` is set). If provided with an existing storage directory, the existing
                 memmaps will be expanded to the provided capacity if needed.
-            use_as_filo_buffer: Set this to use the dataset as an online replay buffer. Calls to `add_episode`
+            use_as_fifo_buffer: Set this to use the dataset as an online replay buffer. Calls to `add_episode`
                 beyond the buffer_capacity, will result in the oldest episodes being pushed out of the buffer
-                to make way for the new ones (first-in-last-out aka FILO).
+                to make way for the new ones (first-in-first-out aka FIFO).
             image_mode: The image storage mode used for the item getter. Options are: "video", "png",
                 "memmap". See notes above for more information on the various options. If not provided it
                 defaults to video mode.
@@ -246,12 +246,12 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
             delta_timestamps: TODO(alexander-soare): Document this somewhere when
                 `load_previous_and_future_frames` is refactored.
         """
-        if use_as_filo_buffer and buffer_capacity is None:
-            raise ValueError(f"A buffer_capacity must be provided if {use_as_filo_buffer=}.")
+        if use_as_fifo_buffer and buffer_capacity is None:
+            raise ValueError(f"A buffer_capacity must be provided if {use_as_fifo_buffer=}.")
 
         self._storage_dir = Path(storage_dir)
         self._data: dict[str, np.memmap] = {}
-        self._use_as_filo_buffer = use_as_filo_buffer
+        self._use_as_fifo_buffer = use_as_fifo_buffer
         self._videos_dir: str | None = None
         self._images_dir: str | None = None
 
@@ -531,8 +531,8 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
         Episodes are added to the dataset one-by-one. If an episode has more frames then are available till
         the end of the numpy.memmap buffer, there are several possibilities:
             - If `buffer_capacity` was not provided at initialization, the memmaps are doubled in size.
-            - If `buffer_capacity` was provided and `use_as_filo_buffer=False`, an exception will be raised.
-            - If `buffer_capacity` was provided and `use_as_filo_buffer=True`, the data insertion pointer is
+            - If `buffer_capacity` was provided and `use_as_fifo_buffer=False`, an exception will be raised.
+            - If `buffer_capacity` was provided and `use_as_fifo_buffer=True`, the data insertion pointer is
                 reset to the start of the memmap and the episode is inserted there, overwriting existing
                 episode frames. When episode frames are overwritten by a new episode, any remaining frames
                 belonging to the existing episode are left in place (meaning not all episodes will be
@@ -554,7 +554,7 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
     def _add_episode(self, data: dict[str, np.ndarray], from_huggingface_hub: bool = False):
         """Add a single episode to the dataset.
 
-        Also manages FILO logic.
+        Also manages FIFO logic.
 
         Also attempt to roll back any changes if an exception occurs mid way.
 
@@ -621,8 +621,8 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
                 # A buffer capacity was not explicitly provided, so dynamically resize the memmaps (double the
                 # capacity).
                 self._extend_memmaps(capacity * 2)
-            elif self._use_as_filo_buffer:
-                # A buffer capacity was provided and we wish to use the dataset as a FILO buffer. Wrap to the
+            elif self._use_as_fifo_buffer:
+                # A buffer capacity was provided and we wish to use the dataset as a FIFO buffer. Wrap to the
                 # start.
                 next_index = 0
             else:
@@ -682,7 +682,7 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
                         self._data[k][slc] = data[k]
                     self._data[self.OCCUPANCY_MASK_KEY][slc] = True
         except Exception as e:
-            if self._use_as_filo_buffer:
+            if self._use_as_fifo_buffer:
                 # Roll back is not implemented for this scenario.
                 logging.warning(
                     "An exception was caught while adding an episode to the dataset. If you have issues "
@@ -704,12 +704,12 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
         self._data[self.NEXT_INDEX_KEY][0] = next_index + new_data_length
 
         # Remove stale videos or PNG files if needed.
-        if self._use_as_filo_buffer and LeRobotDatasetV2ImageMode.needs_decoding(self._image_mode):
+        if self._use_as_fifo_buffer and LeRobotDatasetV2ImageMode.needs_decoding(self._image_mode):
             self._remove_stale_image_files()
 
     def _remove_stale_image_files(self):
         """Remove image files that are not aligned with the episode / frame indices in the memmaps."""
-        if self._use_as_filo_buffer and LeRobotDatasetV2ImageMode.needs_decoding(self._image_mode):
+        if self._use_as_fifo_buffer and LeRobotDatasetV2ImageMode.needs_decoding(self._image_mode):
             relevant_file_names = []
             if self._image_mode == LeRobotDatasetV2ImageMode.VIDEO:
                 for k in self.camera_keys:
@@ -1259,6 +1259,37 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
                 f"{LeRobotDatasetV2.IMAGE_KEY_PREFIX}) could be found"
             )
 
+    def switch_image_mode(self, image_mode: LeRobotDatasetV2ImageMode):
+        if self._image_mode != LeRobotDatasetV2ImageMode.VIDEO:
+            raise NotImplementedError
+        if image_mode != LeRobotDatasetV2ImageMode.MEMMAP:
+            raise NotImplementedError
+        if image_mode in self._infer_image_modes():
+            self._image_mode = image_mode
+            return
+        new_memmaps_created = False
+        for episode_index in self.get_unique_episode_indices():
+            where_episode = np.where(
+                np.bitwise_and(
+                    self._data[self.EPISODE_INDEX_KEY] == episode_index, self._data[self.OCCUPANCY_MASK_KEY]
+                )
+            )[0]
+            episode_data = self.get_episode(episode_index)
+            if not new_memmaps_created:
+                extra_data_spec = {}
+                for k, v in episode_data.items():
+                    if not k.startswith(self.IMAGE_KEY_PREFIX):
+                        continue
+                    extra_data_spec[k] = {"dtype": v.dtype, "shape": (len(self), *v.shape[1:])}
+                self._make_memmaps(extra_data_spec, mode="w+")
+                data_spec = self._load_metadata()["_data_spec"]
+                data_spec.update(extra_data_spec)
+                self._save_metadata(data_spec=data_spec)
+                new_memmaps_created = True
+            for k in self.camera_keys:
+                self._data[k][where_episode] = episode_data[k]
+        self._image_mode = image_mode
+
 
 def compute_sampler_weights(
     offline_dataset: LeRobotDataset,
@@ -1326,7 +1357,7 @@ def compute_sampler_weights(
             start_index = where_episode[0][0]
             end_index = where_episode[0][-1] + 1
             online_data_mask_indices.extend(
-                range(start_index.item(), end_index.item() - online_drop_n_last_frames)
+                range(start_index.item(), end_index.item() - offline_drop_n_last_frames)
             )
         online_data_mask = torch.zeros(len(online_dataset), dtype=torch.bool)
         online_data_mask[torch.tensor(online_data_mask_indices)] = True

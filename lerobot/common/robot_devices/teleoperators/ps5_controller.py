@@ -41,7 +41,6 @@ def read_gamepad(gamepad_last_state):
 class PS5Controller:
     gamepad_last_state = [128, 128, 128, 128, 0, 0, 0, 0, 0]
     gamepad_read_thread = threading.Thread(target=read_gamepad, args=(gamepad_last_state,))
-    gamepad_read_thread.start()
 
     def __init__(self):
         try:
@@ -51,6 +50,8 @@ class PS5Controller:
         self._kill = False
         self._flag_raised = False
         self._lock = threading.Lock()
+        if not self.gamepad_read_thread.is_alive():
+            self.gamepad_read_thread.start()
 
     def read(self, reference_joint_state):
         time.sleep(0.0001)  # give some time to read the gamepad

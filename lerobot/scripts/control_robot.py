@@ -117,10 +117,12 @@ import torch
 import tqdm
 from omegaconf import DictConfig
 from PIL import Image
+from safetensors.torch import save_file
 from termcolor import colored
 
-# from safetensors.torch import load_file, save_file
+from lerobot.common.datasets.compute_stats import compute_stats
 from lerobot.common.datasets.online_buffer import LeRobotDatasetV2
+from lerobot.common.datasets.utils import flatten_dict
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.rl import calc_reward_cube_push
 from lerobot.common.robot_devices.robots.factory import make_robot
@@ -420,12 +422,11 @@ def record(
     while (
         episode_index := (dataset.get_unique_episode_indices()[-1] + 1) if len(dataset) > 0 else 0
     ) < num_episodes:
-        logging.info(f"Recording episode {episode_index}")
-        say(f"Recording episode {episode_index}", blocking=True)
-
         direction = "left" if episode_index % 2 == 0 else "right"
         goal_setter = GoalSetter.from_mask_file(f"outputs/goal_mask_{direction}.npy")
-        say(f"Go {direction}", blocking=True)
+        logging.info(f"Recording episode {episode_index}")
+        say(f"Recording episode {episode_index}. Go {direction}", blocking=False)
+
         goal_mask = goal_setter.get_goal_mask()
         where_goal = np.where(goal_mask > 0)
 
@@ -460,6 +461,8 @@ def record(
                         annotated_img[where_goal]
                         - (annotated_img[where_goal] - np.array([255, 255, 255])) // 2
                     )
+                    # Hflip to better orient the viewer
+                    annotated_img = annotated_img[:, ::-1]
                     annotated_img = cv2.resize(annotated_img, (640, 480))
                     cv2.putText(
                         annotated_img,
@@ -473,9 +476,6 @@ def record(
                     cv2.imshow(key, cv2.cvtColor(annotated_img, cv2.COLOR_RGB2BGR))
                     ep_dict["next.reward"].append(reward.astype(np.float32))
                     ep_dict["next.success"].append(success)
-                    observation[key][where_goal] = observation[key][where_goal] // 2 + torch.tensor(
-                        [127, 127, 127], dtype=observation[key].dtype
-                    )
                     if success:
                         say("Goal accomplished.", blocking=True)
                         exit_early = True
@@ -485,7 +485,11 @@ def record(
                 cv2.waitKey(1)
 
             for key in observation:
-                ep_dict[key].append(observation[key].numpy())
+                data = observation[key].numpy()
+                if key in image_keys:
+                    # Highlight the goal region.
+                    data[where_goal] = data[where_goal] // 2 + np.array([127, 127, 127], dtype=np.uint8)
+                ep_dict[key].append(data)
 
             if policy is not None:
                 with (
@@ -582,12 +586,23 @@ def record(
             say("Done recording", blocking=True)
             if not is_headless():
                 listener.stop()
+            break
 
     robot.disconnect()
     if not is_headless():
         cv2.destroyAllWindows()
 
     num_episodes = episode_index
+
+    if run_compute_stats:
+        logging.info("Computing dataset statistics")
+        say("Computing dataset statistics")
+        stats = compute_stats(dataset)
+        stats_path = dataset.storage_dir / "stats.safetensors"
+        save_file(flatten_dict(stats), stats_path)
+    else:
+        stats = {}
+        logging.info("Skipping computation of the dataset statistics")
 
     if push_to_hub:
         # TODO(now)
