@@ -58,7 +58,6 @@ from lerobot.common.utils.utils import (
 from lerobot.scripts.eval_real import eval_policy
 
 CLIP = np.array([5, 8, 10, 10, 12, 5])
-FPS = 20.0
 
 
 def make_optimizer_and_scheduler(cfg, policy):
@@ -355,13 +354,13 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         image_transform=image_transforms,
     )
     offline_dataset.switch_image_mode(LeRobotDatasetV2ImageMode.MEMMAP)
-    offline_dataset.stats = unflatten_dict(load_file(offline_dataset.storage_dir / "stats.safetensors"))
+    offline_dataset_stats = unflatten_dict(load_file(offline_dataset.storage_dir / "stats.safetensors"))
     if cfg.get("override_dataset_stats", False):
         for key, stats_dict in cfg.override_dataset_stats.items():
             for stats_type, listconfig in stats_dict.items():
-                # example of stats_type: min, max, mean, std
-                stats = OmegaConf.to_container(listconfig, resolve=True)
-                offline_dataset.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+                offline_dataset_stats[key][stats_type] = torch.tensor(
+                    OmegaConf.to_container(listconfig, resolve=True), dtype=torch.float32
+                )
 
     if isinstance(offline_dataset, MultiLeRobotDataset):
         logging.info(
@@ -380,7 +379,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     logging.info("make_policy")
     policy = make_policy(
         hydra_cfg=cfg,
-        dataset_stats=offline_dataset.stats if not (cfg.resume or cfg.policy.pretrained_model_path) else None,
+        dataset_stats=offline_dataset_stats if not (cfg.resume or cfg.policy.pretrained_model_path) else None,
         pretrained_policy_name_or_path=str(logger.last_pretrained_model_dir)
         if cfg.resume
         else cfg.policy.pretrained_model_path,
@@ -408,6 +407,9 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
     logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
+    robot: ManipulatorRobot = make_robot(init_hydra_config("lerobot/configs/robot/koch_.yaml"))
+    robot.connect()
+
     # Note: this helper will be used in offline and online training loops.
     def evaluate_and_checkpoint_if_needed(step, is_online):
         _num_digits = max(6, len(str(cfg.training.offline_steps + cfg.training.online_steps)))
@@ -417,15 +419,18 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             logging.info(f"Eval policy at step {step}")
             with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.use_amp else nullcontext():
                 assert eval_env is not None
-                eval_info = eval_policy(robot, policy, cfg.eval.n_action_buffer)
-                # eval_info = eval_policy(
-                #     eval_env,
-                #     policy,
-                #     cfg.eval.n_episodes,
-                #     videos_dir=Path(out_dir) / "eval" / f"videos_step_{step_identifier}",
-                #     max_episodes_rendered=4,
-                #     start_seed=cfg.seed,
-                # )
+                eval_info = eval_policy(
+                    robot,
+                    policy,
+                    offline_dataset.fps,
+                    n_episodes=cfg.training.online_rollout_n_episodes,
+                    n_action_buffer=2,
+                    warmup_time_s=1,
+                    use_relative_actions=True,
+                    max_steps=100,
+                    visualize_img=True,
+                    visualize_3d=False,
+                )
             log_eval_info(logger, eval_info["aggregated"], step, cfg, offline_dataset, is_online=is_online)
             if cfg.wandb.enable:
                 logger.log_video(eval_info["video_paths"][0], step, mode="eval")
@@ -518,11 +523,6 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
 
     # Online training.
 
-    # Create an env dedicated to online episodes collection from policy rollout.
-    # online_env = make_env(cfg, n_envs=cfg.training.online_rollout_batch_size)
-    robot: ManipulatorRobot = make_robot(init_hydra_config("lerobot/configs/robot/koch_.yaml"))
-    robot.connect()
-
     online_buffer_path = logger.log_dir / "online_buffer"
     if cfg.resume and not online_buffer_path.exists():
         # If we are resuming a run, we default to the data shapes and buffer capacity from the saved online
@@ -538,7 +538,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         buffer_capacity=cfg.training.online_buffer_capacity if not cfg.resume else None,
         use_as_fifo_buffer=True,
         image_mode=LeRobotDatasetV2ImageMode.MEMMAP,
-        fps=FPS,  # online_env.unwrapped.metadata["render_fps"],
+        fps=offline_dataset.fps,
         delta_timestamps=cfg.training.delta_timestamps,
     )
 
@@ -562,6 +562,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         online_dataset=online_dataset,
         # +1 because online rollouts return an extra frame for the "final observation". Note: we don't have
         # this final observation in the offline datasets, but we might add them in future.
+        # TODO(now): Should I put this in the data recording script?
         online_drop_n_last_frames=cfg.training.get("drop_n_last_frames", 0) + 1,
         online_sampling_ratio=cfg.training.online_sampling_ratio,
     )
@@ -612,7 +613,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                 eval_info = eval_policy(
                     robot,
                     policy,
-                    FPS,
+                    offline_dataset.fps,
                     n_episodes=cfg.training.online_rollout_n_episodes,
                     n_action_buffer=2,
                     warmup_time_s=1,
@@ -621,17 +622,6 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                     visualize_img=True,
                     visualize_3d=False,
                 )
-                # eval_info = eval_policy(
-                #     online_env,
-                #     online_rollout_policy,
-                #     n_episodes=cfg.training.online_rollout_n_episodes,
-                #     max_episodes_rendered=min(10, cfg.training.online_rollout_n_episodes),
-                #     videos_dir=logger.log_dir / "online_rollout_videos",
-                #     return_episode_data=True,
-                #     start_seed=(
-                #         rollout_start_seed := (rollout_start_seed + cfg.training.batch_size) % 1000000
-                #     ),
-                # )
                 if len(online_dataset) > 0:
                     log_eval_info(logger, eval_info["aggregated"], step, cfg, online_dataset, is_online=True)  # noqa: B023
             online_rollout_s = time.perf_counter() - start_rollout_time
@@ -650,7 +640,8 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                     online_dataset=online_dataset,
                     # +1 because online rollouts return an extra frame for the "final observation". Note: we don't have
                     # this final observation in the offline datasets, but we might add them in future.
-                    online_drop_n_last_frames=cfg.training.get("drop_n_last_frames", 0),
+                    # TODO(now): Should I put this in the data recording script?
+                    online_drop_n_last_frames=cfg.training.get("drop_n_last_frames", 0) + 1,
                     online_sampling_ratio=cfg.training.online_sampling_ratio,
                 )
                 sampler.num_samples = len(concat_dataset)

@@ -310,8 +310,6 @@ def record(
     video=True,
     run_compute_stats=True,
     push_to_hub=True,
-    tags=None,
-    num_image_writers_per_camera=4,
     force_override=False,
 ):
     # TODO(rcadene): Add option to record logs
@@ -333,7 +331,7 @@ def record(
     if local_dir.exists() and force_override:
         shutil.rmtree(local_dir)
 
-    dataset = LeRobotDatasetV2(repo_id, fps=fps)
+    dataset = LeRobotDatasetV2(local_dir, fps=fps)
 
     if is_headless():
         logging.info(
@@ -720,22 +718,6 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Upload dataset to Hugging Face hub.",
-    )
-    parser_record.add_argument(
-        "--tags",
-        type=str,
-        nargs="*",
-        help="Add tags to your dataset on the hub.",
-    )
-    parser_record.add_argument(
-        "--num-image-writers-per-camera",
-        type=int,
-        default=4,
-        help=(
-            "Number of threads writing the frames as png images on disk, per camera. "
-            "Too much threads might cause unstable teleoperation fps due to main thread being blocked. "
-            "Not enough threads might cause low camera fps."
-        ),
     )
     parser_record.add_argument(
         "--force-override",

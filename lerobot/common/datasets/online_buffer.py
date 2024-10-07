@@ -1184,6 +1184,7 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
                 raise StorageDirCorruptError(f"Missing memmap for key {k}")
 
         # Check that all of the memmaps have the same first array dimension (as per the data_spec).
+
         for k, v in data_spec.items():
             if k == LeRobotDatasetV2.NEXT_INDEX_KEY:
                 continue
@@ -1268,6 +1269,8 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
             self._image_mode = image_mode
             return
         new_memmaps_created = False
+        # Reset data pointer to overwrite existing data.
+        self._data[self.NEXT_INDEX_KEY][0] = 0
         for episode_index in self.get_unique_episode_indices():
             where_episode = np.where(
                 np.bitwise_and(
