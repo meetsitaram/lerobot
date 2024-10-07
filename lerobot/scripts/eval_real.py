@@ -32,7 +32,7 @@ from lerobot.common.robot_devices.teleoperators.ps5_controller import PS5Control
 from lerobot.common.robot_devices.utils import busy_wait
 from lerobot.common.utils.digital_twin import DigitalTwin
 from lerobot.common.utils.utils import get_safe_torch_device, init_hydra_config, init_logging, set_global_seed
-from lerobot.common.vision import GoalSetter
+from lerobot.common.vision import GoalSetter, segment_hsv
 from lerobot.scripts.eval import get_pretrained_policy_path
 
 
@@ -66,6 +66,7 @@ def rollout(
 ) -> dict:
     goal_setter_left = GoalSetter.from_mask_file("outputs/goal_mask_left.npy")
     goal_setter_right = GoalSetter.from_mask_file("outputs/goal_mask_right.npy")
+    in_bounds_mask = GoalSetter.from_mask_file("outputs/goal_mask_center.npy").get_goal_mask()
     goal_mask_left = goal_setter_left.get_goal_mask()
     goal_mask_right = goal_setter_right.get_goal_mask()
 
@@ -99,9 +100,18 @@ def rollout(
     else:
         goal_mask = goal_mask_left  # goal is on the left
         goal = "left"
-        start_pos = "right"  # if random.random() < 0.9 else "left"  # make it more likely to start right
+        start_pos = "right"  # if random.random() < 0.9 else "left"  # make it more likely to start right.
+
     say(f"Go {goal}", blocking=True)
     reset_for_cube_push(robot, right=start_pos == "right")
+
+    while True:
+        observation: dict[str, torch.Tensor] = robot.capture_observation()
+        cube_mask, _ = segment_hsv(observation["observation.images.webcam"].numpy())
+        if np.count_nonzero(cube_mask & in_bounds_mask) == np.count_nonzero(cube_mask):
+            break
+        say("Cube is out of bounds! Help.")
+        time.sleep(5)
 
     where_goal = torch.where(torch.from_numpy(goal_mask) > 0)
 

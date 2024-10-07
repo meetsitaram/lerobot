@@ -534,7 +534,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         )
     online_dataset = LeRobotDatasetV2(
         online_buffer_path,
-        buffer_capacity=cfg.training.online_buffer_capacity if not cfg.resume else None,
+        buffer_capacity=cfg.training.online_buffer_capacity,
         use_as_fifo_buffer=True,
         image_mode=LeRobotDatasetV2ImageMode.MEMMAP,
         fps=offline_dataset.fps,

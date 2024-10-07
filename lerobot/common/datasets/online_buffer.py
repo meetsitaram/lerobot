@@ -892,10 +892,11 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
                 if not (
                     (query_ts[is_pad] < episode_timestamps[0]) | (episode_timestamps[-1] < query_ts[is_pad])
                 ).all():
-                    raise TimestampOutsideToleranceError(
+                    logging.warning(
                         f"One or several timestamps unexpectedly violate the tolerance ({min_} > "
                         f"{self.tolerance_s=}) inside the episode range."
                     )
+                    return self.__getitem__(np.random.choice(len(self)))
 
                 # For image data, either decode video frames, load PNG files, or slice the memmap. For all
                 # other data, slice the memmap.
