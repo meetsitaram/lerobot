@@ -106,7 +106,6 @@ import shutil
 import time
 import traceback
 from collections import defaultdict
-from contextlib import nullcontext
 from functools import cache
 from itertools import chain
 from pathlib import Path
@@ -315,6 +314,8 @@ def record(
     # TODO(rcadene): Add option to record logs
     # TODO(rcadene): Clean this function via decomposition in higher level functions
 
+    assert policy is None
+
     _, dataset_name = repo_id.split("/")
     if dataset_name.startswith("eval_") and policy is None:
         raise ValueError(
@@ -441,11 +442,17 @@ def record(
             else:
                 observation = robot.capture_observation()
 
+            assert len(action) == 1
+
+            # To relative action
+            action["action"] = action["action"] - observation["observation.state"]
+
             image_keys = [k for k in observation if k.startswith(LeRobotDatasetV2.IMAGE_KEY_PREFIX)]
+            assert len(image_keys) == 1
 
             if not is_headless():
                 for key in image_keys:
-                    this_relative_action = (action["action"] - observation["observation.state"]).numpy()
+                    this_relative_action = action["action"].numpy()
                     reward, success, do_terminate, info = calc_reward_cube_push(
                         img=observation[key].numpy(),
                         goal_mask=goal_mask,
@@ -488,38 +495,6 @@ def record(
                     # Highlight the goal region.
                     data[where_goal] = data[where_goal] // 2 + np.array([127, 127, 127], dtype=np.uint8)
                 ep_dict[key].append(data)
-
-            if policy is not None:
-                with (
-                    torch.inference_mode(),
-                    torch.autocast(device_type=device.type)
-                    if device.type == "cuda" and hydra_cfg.use_amp
-                    else nullcontext(),
-                ):
-                    # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
-                    for name in observation:
-                        if "image" in name:
-                            observation[name] = observation[name].type(torch.float32) / 255
-                            observation[name] = observation[name].permute(2, 0, 1).contiguous()
-                        observation[name] = observation[name].unsqueeze(0)
-                        observation[name] = observation[name].to(device)
-
-                    # Compute the next action with the policy
-                    # based on the current observation
-                    action = policy.select_action(observation)
-
-                    # Remove batch dimension
-                    action = action.squeeze(0)
-
-                    # Move to cpu, if not already the case
-                    action = action.to("cpu")
-
-                # Order the robot to move
-                action_sent = robot.send_action(action)
-
-                # Action can eventually be clipped using `max_relative_target`,
-                # so action actually sent is saved in the dataset.
-                action = {"action": action_sent}
 
             for key in action:
                 ep_dict[key].append(action[key].numpy().astype(np.float32))

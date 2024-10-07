@@ -1272,8 +1272,6 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
             self._image_mode = image_mode
             return
         new_memmaps_created = False
-        # Reset data pointer to overwrite existing data.
-        self._data[self.NEXT_INDEX_KEY][0] = 0
         for episode_index in self.get_unique_episode_indices():
             where_episode = np.where(
                 np.bitwise_and(
@@ -1286,7 +1284,10 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
                 for k, v in episode_data.items():
                     if not k.startswith(self.IMAGE_KEY_PREFIX):
                         continue
-                    extra_data_spec[k] = {"dtype": v.dtype, "shape": (len(self), *v.shape[1:])}
+                    extra_data_spec[k] = {
+                        "dtype": v.dtype,
+                        "shape": (len(self._data[self.INDEX_KEY]), *v.shape[1:]),
+                    }
                 self._make_memmaps(extra_data_spec, mode="w+")
                 data_spec = self._load_metadata()["_data_spec"]
                 data_spec.update(extra_data_spec)
