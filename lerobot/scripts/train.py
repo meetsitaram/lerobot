@@ -22,7 +22,6 @@ from pprint import pformat
 from threading import Lock
 
 import hydra
-import numpy as np
 import torch
 import torch.utils
 from deepdiff import DeepDiff
@@ -57,7 +56,7 @@ from lerobot.common.utils.utils import (
 )
 from lerobot.scripts.eval_real import eval_policy
 
-CLIP = np.array([5, 8, 10, 10, 12, 5])
+MAX_STEPS = 100
 
 
 def make_optimizer_and_scheduler(cfg, policy):
@@ -427,7 +426,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                     n_action_buffer=2,
                     warmup_time_s=1,
                     use_relative_actions=True,
-                    max_steps=100,
+                    max_steps=MAX_STEPS,
                     visualize_img=True,
                     visualize_3d=False,
                 )
@@ -618,7 +617,7 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
                     n_action_buffer=2,
                     warmup_time_s=1,
                     use_relative_actions=True,
-                    max_steps=100,
+                    max_steps=MAX_STEPS,
                     visualize_img=True,
                     visualize_3d=False,
                 )
