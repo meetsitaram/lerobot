@@ -225,6 +225,7 @@ class OpenCVCamera:
         self.logs = {}
 
     def connect(self):
+        print("opencv camera connect")
         if self.is_connected:
             raise RobotDeviceAlreadyConnectedError(f"OpenCVCamera({self.camera_index}) is already connected.")
 
@@ -272,6 +273,8 @@ class OpenCVCamera:
         actual_fps = self.camera.get(cv2.CAP_PROP_FPS)
         actual_width = self.camera.get(cv2.CAP_PROP_FRAME_WIDTH)
         actual_height = self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        
+        print("camera dims:", actual_width, actual_height)
 
         if self.fps is not None and not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
             raise OSError(
@@ -331,7 +334,7 @@ class OpenCVCamera:
         # log the utc time at which the image was received
         self.logs["timestamp_utc"] = capture_timestamp_utc()
 
-        color_image = cv2.resize(color_image, (88, 66))
+        # color_image = cv2.resize(color_image, (88, 66)) $ TODO check why image is resized here
 
         return color_image
 

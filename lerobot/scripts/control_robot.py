@@ -405,8 +405,15 @@ def record(
 
         if not is_headless():
             image_keys = [key for key in observation if "image" in key]
+            # print("showing camera image during warm up")
             for key in image_keys:
+                # print("image shape:", observation[key].shape)
+                # resized_img = cv2.resize(observation[key].numpy(), (640, 480))
+                # cv2.imshow(key, cv2.cvtColor(resized_img, cv2.COLOR_RGB2BGR))
                 cv2.imshow(key, cv2.cvtColor(observation[key].numpy(), cv2.COLOR_RGB2BGR))
+                ## save image for masking
+                # say(f"saving image")
+                # cv2.imwrite(f"{key}.png", cv2.cvtColor(observation[key].numpy(), cv2.COLOR_RGB2BGR))   
             cv2.waitKey(1)
 
         dt_s = time.perf_counter() - start_loop_t
@@ -422,12 +429,23 @@ def record(
         episode_index := (dataset.get_unique_episode_indices()[-1] + 1) if len(dataset) > 0 else 0
     ) < num_episodes:
         direction = "left" if episode_index % 2 == 0 else "right"
-        goal_setter = GoalSetter.from_mask_file(f"outputs/goal_mask_{direction}.npy")
+
+
+        goal_setters = {}
+        goal_masks = {}
+        where_goals = {}
+        for key in image_keys:
+            goal_setters[key] = GoalSetter.from_mask_file(f"goal_mask_{key}_{direction}.npy")
+            goal_masks[key] = goal_setters[key].get_goal_mask()
+            where_goals[key] = np.where(goal_masks[key] > 0)
+
+        # goal_setter = GoalSetter.from_mask_file(f"outputs/goal_mask_{direction}.npy")
+        # goal_setter = GoalSetter.from_mask_file(f"frame_mask_{direction}.npy")
         logging.info(f"Recording episode {episode_index}")
         say(f"Recording episode {episode_index}. Go {direction}", blocking=False)
 
-        goal_mask = goal_setter.get_goal_mask()
-        where_goal = np.where(goal_mask > 0)
+        # goal_mask = goal_setter.get_goal_mask()
+        # where_goal = np.where(goal_mask > 0)
 
         ep_dict = defaultdict(list)
         frame_index = 0
@@ -447,28 +465,38 @@ def record(
             # To relative action
             action["action"] = action["action"] - observation["observation.state"]
 
+            # print("keys:", observation.keys())
             image_keys = [k for k in observation if k.startswith(LeRobotDatasetV2.IMAGE_KEY_PREFIX)]
-            assert len(image_keys) == 1
+            assert len(image_keys) > 0
 
+            # for key in image_keys:
+            #     cv2.imwrite(f"framne_{key}.png", observation[key])
+
+            # say("break here")
+            # break
+        
             if not is_headless():
                 for key in image_keys:
                     this_relative_action = action["action"].numpy()
                     reward, success, do_terminate, info = calc_reward_cube_push(
                         img=observation[key].numpy(),
-                        goal_mask=goal_mask,
+                        goal_mask=goal_masks[key],
                         current_joint_pos=observation["observation.state"].numpy(),
                         action=this_relative_action,
                         prior_action=prior_relative_action,
                     )
                     prior_relative_action = this_relative_action.copy()
                     annotated_img = info["annotated_img"]
-                    annotated_img[where_goal] = (
-                        annotated_img[where_goal]
-                        - (annotated_img[where_goal] - np.array([255, 255, 255])) // 2
+
+                    annotated_img[where_goals[key]] = (
+                        annotated_img[where_goals[key]]
+                        - (annotated_img[where_goals[key]] - np.array([255, 255, 255])) // 2
                     )
                     # Hflip to better orient the viewer
-                    annotated_img = annotated_img[:, ::-1]
+                    # annotated_img = annotated_img[:, ::-1] # TODO uncomment; regular view is better from my view point
+
                     annotated_img = cv2.resize(annotated_img, (640, 480))
+                    
                     cv2.putText(
                         annotated_img,
                         org=(10, 25),
@@ -493,7 +521,7 @@ def record(
                 data = observation[key].numpy()
                 if key in image_keys:
                     # Highlight the goal region.
-                    data[where_goal] = data[where_goal] // 2 + np.array([127, 127, 127], dtype=np.uint8)
+                    data[where_goals[key]] = data[where_goals[key]] // 2 + np.array([127, 127, 127], dtype=np.uint8)
                 ep_dict[key].append(data)
 
             for key in action:

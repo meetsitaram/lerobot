@@ -40,6 +40,9 @@ from lerobot.common.datasets.video_utils import (
     encode_video_frames,
 )
 
+import win32api
+
+
 # Take no more than 80% of the available storage space when creating memmaps.
 MEMMAP_STORAGE_PCT_CAP = 0.8
 
@@ -199,7 +202,7 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
     TIMESTAMP_KEY = "timestamp"
     PRESET_KEYS = {INDEX_KEY, FRAME_INDEX_KEY, EPISODE_INDEX_KEY, TIMESTAMP_KEY}
     # By convention, all images should be stored under a key with this prefix.
-    IMAGE_KEY_PREFIX = "observation.image"
+    IMAGE_KEY_PREFIX = "observation.images"
 
     METADATA_FILE_NAME = "metadata.json"
 
@@ -438,7 +441,7 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
                 continue
             is_image_key = k.startswith(self.IMAGE_KEY_PREFIX)
             if is_image_key and self._image_mode == LeRobotDatasetV2ImageMode.VIDEO:
-                (self._storage_dir / self.VIDEOS_DIR).mkdir()
+                (self._storage_dir / self.VIDEOS_DIR).mkdir(exist_ok=True)
             elif is_image_key and self._image_mode == LeRobotDatasetV2ImageMode.PNG:
                 (self._storage_dir / self.PNGS_DIR).mkdir()
             else:
@@ -467,14 +470,16 @@ class LeRobotDatasetV2(torch.utils.data.Dataset):
         required_space = 0
         for spec in data_spec.values():
             required_space += spec["dtype"].itemsize * np.prod(spec["shape"])  # bytes
-        stats = os.statvfs(self._storage_dir)
-        available_space = stats.f_bavail * stats.f_frsize  # bytes
-        if required_space >= available_space * MEMMAP_STORAGE_PCT_CAP:
-            raise DiskSpaceError(
-                f"You're about to take up {required_space} of {available_space} bytes available. This "
-                "exception has been raised to protect your storage device."
-                ""
-            )
+        # stats = os.statvfs(self._storage_dir)
+        ## free_bytes, total_bytes, total_free_bytes = win32api.GetDiskFreeSpaceEx(self._storage_dir)
+        ## print (free_bytes, required_space)
+        # available_space = stats.f_bavail * stats.f_frsize  # bytes
+        # if required_space >= available_space * MEMMAP_STORAGE_PCT_CAP:
+            # raise DiskSpaceError(
+            #     f"You're about to take up {required_space} of {available_space} bytes available. This "
+            #     "exception has been raised to protect your storage device."
+            #     ""
+            # )
 
         for k, v in data_spec.items():
             self._data[k] = np.memmap(

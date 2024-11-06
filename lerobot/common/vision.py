@@ -89,6 +89,8 @@ class GoalSetter:
             mask = self._mask
         self._img_rgb[np.where(mask)] = np.array([255, 255, 255])
         cv2.imshow(self._window_name, cv2.cvtColor(self._img_rgb, cv2.COLOR_BGR2RGB))
+        # cv2.imshow(self._window_name, cv2.cvtColor(self._img_rgb, cv2.COLOR_RGB2BGR))
+        
 
     def set_image(self, img_rgb, resize_factor: float = 1.0):
         self._mask = np.zeros(shape=img_rgb.shape[:2], dtype=np.uint8)
