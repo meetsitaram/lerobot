@@ -1,0 +1,1 @@
+python lerobot/scripts/control_robot.py record --robot-path lerobot/configs/robot/koch.yaml --fps 30 --root data --repo-id workshop/koch_test --tags tutorial --push-to-hub 0 --warmup-time-s 30 --episode-time-s 180 --reset-time-s 15 --num-episodes 2

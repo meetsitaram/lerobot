@@ -1,0 +1,1 @@
+python lerobot/scripts/visualize_dataset.py --root data --repo-id workshop/koch_test --episode-index 0
