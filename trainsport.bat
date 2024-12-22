@@ -1,0 +1,1 @@
+python lerobot/scripts/train.py  dataset_repo_id=workshop/koch_sport policy=act_koch_real env=koch_real hydra.run.dir=outputs/train/koch_sport hydra.job.name=koch_sport device=cuda wandb.enable=false wandb.project=lerobot

@@ -1,0 +1,1 @@
+python lerobot/scripts/control_robot.py replay --fps 30 --root data --repo-id workshop/koch_sport --episode 0
