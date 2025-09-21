@@ -26,33 +26,37 @@ from lerobot.motors.dynamixel import (
 )
 
 from ..teleoperator import Teleoperator
-from .config_koch_leader import KochLeaderConfig
+from .config_ascii_leader import AsciiLeaderConfig
 
 logger = logging.getLogger(__name__)
 
 
-class KochLeader(Teleoperator):
+class AsciiLeader(Teleoperator):
     """
-    - [Koch v1.0](https://github.com/AlexanderKoch-Koch/low_cost_robot), with and without the wrist-to-elbow
-        expansion, developed by Alexander Koch from [Tau Robotics](https://tau-robotics.com)
-    - [Koch v1.1](https://github.com/jess-moss/koch-v1-1) developed by Jess Moss
+    ASCII-based leader teleoperator (clone of KochLeader behaviour with different naming).
     """
 
-    config_class = KochLeaderConfig
-    name = "koch_leader"
+    config_class = AsciiLeaderConfig
+    name = "ascii_leader"
 
-    def __init__(self, config: KochLeaderConfig):
+    def __init__(self, config: AsciiLeaderConfig):
         super().__init__(config)
         self.config = config
         self.bus = DynamixelMotorsBus(
             port=self.config.port,
             motors={
-                "shoulder_pan": Motor(1, "xl330-m077", MotorNormMode.RANGE_M100_100),
-                "shoulder_lift": Motor(2, "xl330-m077", MotorNormMode.RANGE_M100_100),
-                "elbow_flex": Motor(3, "xl330-m077", MotorNormMode.RANGE_M100_100),
-                "wrist_flex": Motor(4, "xl330-m077", MotorNormMode.RANGE_M100_100),
-                "wrist_roll": Motor(5, "xl330-m077", MotorNormMode.RANGE_M100_100),
-                "gripper": Motor(6, "xl330-m077", MotorNormMode.RANGE_0_100),
+                "right_shoulder_pan": Motor(1, "xl330-m077", MotorNormMode.RANGE_M100_100),
+                "right_shoulder_lift": Motor(2, "xl330-m077", MotorNormMode.RANGE_M100_100),
+                "right_elbow_flex": Motor(3, "xl330-m077", MotorNormMode.RANGE_M100_100),
+                "right_wrist_flex": Motor(4, "xl330-m077", MotorNormMode.RANGE_M100_100),
+                "right_wrist_roll": Motor(5, "xl330-m077", MotorNormMode.RANGE_M100_100),
+                "right_gripper": Motor(6, "xl330-m077", MotorNormMode.RANGE_0_100),
+                "left_shoulder_pan": Motor(7, "xl330-m077", MotorNormMode.RANGE_M100_100),
+                "left_shoulder_lift": Motor(8, "xl330-m077", MotorNormMode.RANGE_M100_100),
+                "left_elbow_flex": Motor(9, "xl330-m077", MotorNormMode.RANGE_M100_100),
+                "left_wrist_flex": Motor(10, "xl330-m077", MotorNormMode.RANGE_M100_100),
+                "left_wrist_roll": Motor(11, "xl330-m077", MotorNormMode.RANGE_M100_100),
+                "left_gripper": Motor(12, "xl330-m077", MotorNormMode.RANGE_0_100),
             },
             # self.bus.write("Drive_Mode", "elbow_flex", DriveMode.INVERTED.value)
             calibration=self.calibration,
@@ -103,8 +107,10 @@ class KochLeader(Teleoperator):
         for motor in self.bus.motors:
             self.bus.write("Operating_Mode", motor, OperatingMode.EXTENDED_POSITION.value)
 
-        self.bus.write("Drive_Mode", "elbow_flex", DriveMode.INVERTED.value)
-        drive_modes = {motor: 1 if motor == "elbow_flex" else 0 for motor in self.bus.motors}
+        # self.bus.write("Drive_Mode", "left_elbow_flex", DriveMode.INVERTED.value)
+        self.bus.write("Drive_Mode", "left_wrist_flex", DriveMode.INVERTED.value)
+        self.bus.write("Drive_Mode", "right_wrist_flex", DriveMode.INVERTED.value)
+        drive_modes = {motor: 1 if motor in ["left_wrist_flex", "right_wrist_flex"] else 0 for motor in self.bus.motors}
 
         # self.bus.write("Drive_Mode", "elbow_flex", DriveMode.NON_INVERTED.value)
         # drive_modes = {motor: 0 for motor in self.bus.motors}
@@ -141,26 +147,31 @@ class KochLeader(Teleoperator):
         self.bus.disable_torque()
         self.bus.configure_motors()
         for motor in self.bus.motors:
-            if motor != "gripper":
+            if motor not in  ["left_gripper", "right_gripper"]:
                 # Use 'extended position mode' for all motors except gripper, because in joint mode the servos
                 # can't rotate more than 360 degrees (from 0 to 4095) And some mistake can happen while
                 # assembling the arm, you could end up with a servo with a position 0 or 4095 at a crucial
                 # point
                 self.bus.write("Operating_Mode", motor, OperatingMode.EXTENDED_POSITION.value)
 
-        # Use 'position control current based' for gripper to be limited by the limit of the current.
-        # For the follower gripper, it means it can grasp an object without forcing too much even tho,
-        # its goal position is a complete grasp (both gripper fingers are ordered to join and reach a touch).
-        # For the leader gripper, it means we can use it as a physical trigger, since we can force with our finger
-        # to make it move, and it will move back to its original target position when we release the force.
-        self.bus.write("Operating_Mode", "gripper", OperatingMode.CURRENT_POSITION.value)
-        # Set gripper's goal pos in current position mode so that we can use it as a trigger.
-        self.bus.enable_torque("gripper")
+        # Use 'position control current based' for grippers to be limited by the limit of the current.
+        # This allows each gripper to act as a trigger and spring back to an open position.
+        for g in ("left_gripper", "right_gripper"):
+            if g in self.bus.motors:
+                self.bus.write("Operating_Mode", g, OperatingMode.CURRENT_POSITION.value)
+                # Enable torque for the gripper so it can be used as a physical trigger.
+                self.bus.enable_torque(g)
+
+        # Set grippers' goal pos in current position mode so that we can use them as triggers.
         if self.is_calibrated:
-            self.bus.write("Goal_Position", "gripper", self.config.gripper_open_pos)
+            for g in ("left_gripper", "right_gripper"):
+                if g in self.bus.motors:
+                    self.bus.write("Goal_Position", g, self.config.gripper_open_pos)
 
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):
+            if motor.startswith("right_"):
+                continue    
             input(f"Connect the controller board to the '{motor}' motor only and press enter.")
             self.bus.setup_motor(motor)
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")

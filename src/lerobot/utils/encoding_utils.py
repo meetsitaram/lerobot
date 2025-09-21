@@ -45,15 +45,30 @@ def encode_twos_complement(value: int, n_bytes: int):
     min_val = -(1 << (bit_width - 1))
     max_val = (1 << (bit_width - 1)) - 1
 
-    if not (min_val <= value <= max_val):
-        raise ValueError(
-            f"Value {value} out of range for {n_bytes}-byte two's complement: [{min_val}, {max_val}]"
-        )
+    # Fast path: value already fits in signed range
+    if min_val <= value <= max_val:
+        if value >= 0:
+            return value
+        return (1 << bit_width) + value
 
-    if value >= 0:
-        return value
+    # Try a common normalization: maybe the caller passed an unsigned value or a
+    # value that wrapped incorrectly (for example -4294963418). Normalize by
+    # masking to the lowest `bit_width` bits and check whether that corresponds
+    # to a valid two's-complement signed value.
+    mask = (1 << bit_width) - 1
+    normalized = value & mask
 
-    return (1 << bit_width) + value
+    # Convert normalized back to signed candidate
+    signed_candidate = normalized - (1 << bit_width) if (normalized & (1 << (bit_width - 1))) else normalized
+
+    if min_val <= signed_candidate <= max_val:
+        # Return the unsigned representation (lowest-bit_width bits) which is
+        # the two's-complement encoding of the signed candidate.
+        return normalized
+
+    raise ValueError(
+        f"Value {value} out of range for {n_bytes}-byte two's complement: [{min_val}, {max_val}]"
+    )
 
 
 def decode_twos_complement(value: int, n_bytes: int) -> int:

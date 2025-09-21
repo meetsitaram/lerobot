@@ -25,6 +25,10 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> Teleoperator:
         from .koch_leader import KochLeader
 
         return KochLeader(config)
+    elif config.type == "ascii_leader":
+        from .ascii_leader import AsciiLeader
+
+        return AsciiLeader(config)
     elif config.type == "so100_leader":
         from .so100_leader import SO100Leader
 
