@@ -57,6 +57,8 @@ class AsciiLeader(Teleoperator):
                 "left_wrist_flex": Motor(10, "xl330-m077", MotorNormMode.RANGE_M100_100),
                 "left_wrist_roll": Motor(11, "xl330-m077", MotorNormMode.RANGE_M100_100),
                 "left_gripper": Motor(12, "xl330-m077", MotorNormMode.RANGE_0_100),
+                "waist_roll": Motor(13, "xl330-m288", MotorNormMode.RANGE_M100_100),
+                "waist_linear": Motor(14, "xl330-m288", MotorNormMode.RANGE_M100_100),
             },
             # self.bus.write("Drive_Mode", "elbow_flex", DriveMode.INVERTED.value)
             calibration=self.calibration,
@@ -170,8 +172,9 @@ class AsciiLeader(Teleoperator):
 
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):
-            if motor.startswith("right_"):
-                continue    
+            if motor not in ["waist_roll", "waist_linear"]:
+                # if motor.startswith("right_"):
+                continue
             input(f"Connect the controller board to the '{motor}' motor only and press enter.")
             self.bus.setup_motor(motor)
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")

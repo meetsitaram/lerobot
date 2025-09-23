@@ -60,7 +60,10 @@ class AsciiFollower(Robot):
                 "left_elbow_flex": Motor(9, "sts3215", norm_mode_body),
                 "left_wrist_flex": Motor(10, "sts3215", norm_mode_body),
                 "left_wrist_roll": Motor(11, "sts3215", norm_mode_body),
+                "left_wrist_roll": Motor(11, "sts3215", norm_mode_body),
                 "left_gripper": Motor(12, "sts3215", MotorNormMode.RANGE_0_100),
+                "waist_roll": Motor(13, "sts3215", norm_mode_body),
+                "waist_linear": Motor(14, "sts3215", norm_mode_body),
             },
             calibration=self.calibration,
         )
@@ -163,7 +166,7 @@ class AsciiFollower(Robot):
                 self.bus.write("I_Coefficient", motor, 0)
                 self.bus.write("D_Coefficient", motor, 32)
 
-                if motor == "gripper":
+                if motor in ["left_gripper", "right_gripper", "waist_linear"]:
                     self.bus.write(
                         "Max_Torque_Limit", motor, 500
                     )  # 50% of the max torque limit to avoid burnout
@@ -172,7 +175,8 @@ class AsciiFollower(Robot):
 
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):
-            if motor.startswith("right_"):
+            # if motor not in ["waist_roll", "waist_linear"]:
+            if not motor.startswith("left_"):
                 continue
 
             input(f"Connect the controller board to the '{motor}' motor only and press enter.")

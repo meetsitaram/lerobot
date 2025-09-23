@@ -82,5 +82,19 @@
         "homing_offset": -304,
         "range_min": 1644,
         "range_max": 2644
+    },
+    "waist_roll": {
+        "id": 13,
+        "drive_mode": 0,
+        "homing_offset": 110,
+        "range_min": 1190,
+        "range_max": 2977
+    },
+    "waist_linear": {
+        "id": 14,
+        "drive_mode": 0,
+        "homing_offset": -1000,
+        "range_min": 1035,
+        "range_max": 2356
     }
 }
