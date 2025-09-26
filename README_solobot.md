@@ -83,6 +83,9 @@ python -m lerobot.teleoperate --robot.type=so101_follower --robot.port=COM9 --ro
 ### config
 - saving config to C:\Users\meets/.solo_server\config.json instead of local repo folder
 
+### opencv issue
+`pip install opencv` fixed issue connecting to cameras
+
 ### so101-koch
 conda activate solo
 
@@ -99,3 +102,11 @@ lerobot-calibrate --robot.type=ascii_follower --robot.port=COM11 --robot.id=asci
 lerobot-calibrate --teleop.type=ascii_leader --teleop.port=COM8  --teleop.id=ascii_leader --teleop.calibration_dir="C:\Users\meets\Projects\solobot\lerobot"
 
 python -m lerobot.teleoperate --robot.type=ascii_follower --robot.port=COM11 --robot.id=ascii_follower --robot.calibration_dir="C:\Users\meets\Projects\solobot\lerobot" --teleop.type=ascii_leader --teleop.port=COM8 --teleop.id=ascii_leader --teleop.calibration_dir="C:\Users\meets\Projects\solobot\lerobot"
+
+python -m lerobot.teleoperate --robot.type=ascii_follower --robot.port=COM11 --robot.id=ascii_follower --robot.calibration_dir="C:\Users\meets\Projects\solobot\lerobot" --teleop.type=ascii_leader --teleop.port=COM8 --teleop.id=ascii_leader --teleop.calibration_dir="C:\Users\meets\Projects\solobot\lerobot" --robot.cameras="{ right: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}, left: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}}" --display_data=true
+
+
+# recording
+Press Right Arrow (→): Early stop the current episode or reset time and move to the next.
+Press Left Arrow (←): Cancel the current episode and re-record it.
+Press Escape (ESC): Immediately stop the session, encode videos, and upload the dataset.

@@ -176,8 +176,8 @@ class AsciiFollower(Robot):
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):
             # if motor not in ["waist_roll", "waist_linear"]:
-            if not motor.startswith("left_"):
-                continue
+            # if not motor.startswith("right_"):
+            #     continue
 
             input(f"Connect the controller board to the '{motor}' motor only and press enter.")
             self.bus.setup_motor(motor)

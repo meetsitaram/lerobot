@@ -3,13 +3,13 @@
         "id": 1,
         "drive_mode": 0,
         "homing_offset": 1605,
-        "range_min": 1102,
-        "range_max": 2890
+        "range_min": 1602,
+        "range_max": 3490
     },
     "right_shoulder_lift": {
         "id": 2,
         "drive_mode": 0,
-        "homing_offset": -1418,
+        "homing_offset": -1918,
         "range_min": 823,
         "range_max": 3202
     },
@@ -30,7 +30,7 @@
     "right_wrist_roll": {
         "id": 5,
         "drive_mode": 0,
-        "homing_offset": -1125,
+        "homing_offset": -2025,
         "range_min": 424,
         "range_max": 3714
     },
@@ -51,7 +51,7 @@
     "left_shoulder_lift": {
         "id": 8,
         "drive_mode": 0,
-        "homing_offset": -1095,
+        "homing_offset": -995,
         "range_min": 942,
         "range_max": 3328
     },
