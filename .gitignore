@@ -174,3 +174,4 @@ outputs/
 # Dev folders
 .cache/*
 tinkerbuggy/*
+tokens/*

@@ -110,3 +110,13 @@ python -m lerobot.teleoperate --robot.type=ascii_follower --robot.port=COM11 --r
 Press Right Arrow (→): Early stop the current episode or reset time and move to the next.
 Press Left Arrow (←): Cancel the current episode and re-record it.
 Press Escape (ESC): Immediately stop the session, encode videos, and upload the dataset.
+
+
+### smolvla
+
+
+pip install -e ".[feetech,smolvla]"
+
+  File "C:\Users\meets\Projects\solobot\lerobot-upstream\lerobot\src\lerobot\processor\pipeline.py", line 665, in _load_config
+    raise FileNotFoundError(
+FileNotFoundError: Could not find 'policy_preprocessor.json' on the HuggingFace Hub at 'lerobot/smolvla_base'
