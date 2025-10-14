@@ -105,6 +105,8 @@ python -m lerobot.teleoperate --robot.type=ascii_follower --robot.port=COM11 --r
 
 python -m lerobot.teleoperate --robot.type=ascii_follower --robot.port=COM11 --robot.id=ascii_follower --robot.calibration_dir="C:\Users\meets\Projects\solobot\lerobot" --teleop.type=ascii_leader --teleop.port=COM8 --teleop.id=ascii_leader --teleop.calibration_dir="C:\Users\meets\Projects\solobot\lerobot" --robot.cameras="{ right: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}, left: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}}" --display_data=true
 
+### record
+python -m lerobot.teleoperate --robot.type=ascii_follower --robot.port=COM11 --robot.id=ascii_follower --robot.calibration_dir="C:\Users\meets\Projects\solobot\lerobot" --teleop.type=ascii_leader --teleop.port=COM8 --teleop.id=ascii_leader --teleop.calibration_dir="C:\Users\meets\Projects\solobot\lerobot" --robot.cameras="{ right: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}, left: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}}" --display_data=true
 
 # recording
 Press Right Arrow (→): Early stop the current episode or reset time and move to the next.

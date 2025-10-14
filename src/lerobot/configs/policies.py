@@ -190,18 +190,27 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):
         # apply cli overrides.
         # This is very ugly, ideally we'd like to be able to do that natively with draccus
         # something like --policy.path (in addition to --policy.type)
+
+        print(config_file)
+        if(config_file is None or not os.path.exists(config_file)):
+            raise FileNotFoundError(f"Config file not found: {config_file}")
+        
         with draccus.config_type("json"):
             orig_config = draccus.parse(cls, config_file, args=[])
 
-        with open(config_file) as f:
+        with open(config_file, 'r') as f:
             config = json.load(f)
 
         config.pop("type")
-        with tempfile.NamedTemporaryFile("w+") as f:
-            json.dump(config, f)
-            config_file = f.name
-            f.flush()
 
-            cli_overrides = policy_kwargs.pop("cli_overrides", [])
-            with draccus.config_type("json"):
-                return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_file_path = os.path.join(temp_dir, "act_config.json")
+            with open(temp_file_path, 'w+') as f:
+        # with tempfile.NamedTemporaryFile("w+") as f:
+                json.dump(config, f)
+                config_file = f.name
+                f.flush()
+
+                cli_overrides = policy_kwargs.pop("cli_overrides", [])
+                with draccus.config_type("json"):
+                    return draccus.parse(orig_config.__class__, config_file, args=cli_overrides)
