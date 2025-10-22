@@ -56,6 +56,8 @@ COMPATIBLE_DEVICES = [
     "lekiwi",
     "ascii_follower",
     "ascii_leader",
+    "openduckmini_follower",
+    "openduckmini_leader",
 ]
 
 

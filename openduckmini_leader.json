@@ -1,0 +1,100 @@
+{
+    "right_hip_yaw": {
+        "id": 1,
+        "drive_mode": 1,
+        "homing_offset": -96,
+        "range_min": 777,
+        "range_max": 3061
+    },
+    "right_hip_pitch": {
+        "id": 2,
+        "drive_mode": 0,
+        "homing_offset": -1721,
+        "range_min": 216,
+        "range_max": 2444
+    },
+    "right_knee": {
+        "id": 3,
+        "drive_mode": 0,
+        "homing_offset": 516,
+        "range_min": 387,
+        "range_max": 2620
+    },
+    "right_ankle": {
+        "id": 4,
+        "drive_mode": 0,
+        "homing_offset": 179,
+        "range_min": 110,
+        "range_max": 2519
+    },
+    "right_hip_roll": {
+        "id": 5,
+        "drive_mode": 1,
+        "homing_offset": -976,
+        "range_min": 424,
+        "range_max": 3714
+    },
+    "neck_pitch": {
+        "id": 6,
+        "drive_mode": 0,
+        "homing_offset": -230,
+        "range_min": 1708,
+        "range_max": 2718
+    },
+    "left_hip_yaw": {
+        "id": 7,
+        "drive_mode": 1,
+        "homing_offset": 24,
+        "range_min": 680,
+        "range_max": 3449
+    },
+    "left_hip_pitch": {
+        "id": 8,
+        "drive_mode": 0,
+        "homing_offset": -1938,
+        "range_min": 141,
+        "range_max": 2372
+    },
+    "left_knee": {
+        "id": 9,
+        "drive_mode": 0,
+        "homing_offset": 911,
+        "range_min": 834,
+        "range_max": 3046
+    },
+    "left_ankle": {
+        "id": 10,
+        "drive_mode": 0,
+        "homing_offset": -195,
+        "range_min": 11,
+        "range_max": 2206
+    },
+    "left_hip_roll": {
+        "id": 11,
+        "drive_mode": 1,
+        "homing_offset": -877,
+        "range_min": 775,
+        "range_max": 3494
+    },
+    "head_pitch": {
+        "id": 12,
+        "drive_mode": 0,
+        "homing_offset": -304,
+        "range_min": 1644,
+        "range_max": 2644
+    },
+    "head_roll": {
+        "id": 13,
+        "drive_mode": 0,
+        "homing_offset": 110,
+        "range_min": 1190,
+        "range_max": 2977
+    },
+    "head_yaw": {
+        "id": 14,
+        "drive_mode": 0,
+        "homing_offset": -1000,
+        "range_min": 1035,
+        "range_max": 2356
+    }
+}

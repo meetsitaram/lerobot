@@ -43,6 +43,7 @@ from lerobot.robots import (  # noqa: F401
     so100_follower,
     so101_follower,
     ascii_follower,
+    openduckmini_follower
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,

@@ -1,0 +1,1 @@
+lerobot-teleoperate --robot.type=openduckmini_follower --robot.port=COM5 --robot.id=openduckmini_follower --robot.calibration_dir="C:\Users\meets\Projects\solobot\lerobot" --teleop.type=openduckmini_leader --teleop.port=COM8 --teleop.id=openduckmini_leader --teleop.calibration_dir="C:\Users\meets\Projects\solobot\lerobot"

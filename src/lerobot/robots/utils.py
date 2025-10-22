@@ -41,6 +41,10 @@ def make_robot_from_config(config: RobotConfig) -> Robot:
         from .ascii_follower import AsciiFollower
 
         return AsciiFollower(config)
+    elif config.type == "openduckmini_follower":
+        from .openduckmini_follower import OpenDuckMiniFollower
+
+        return OpenDuckMiniFollower(config)
     elif config.type == "lekiwi":
         from .lekiwi import LeKiwi
 

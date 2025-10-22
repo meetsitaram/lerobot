@@ -29,40 +29,40 @@ from lerobot.motors.feetech import (
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
-from .config_ascii_follower import AsciiFollowerConfig
+from .config_openduckmini_follower import OpenDuckMiniFollowerConfig
 
 logger = logging.getLogger(__name__)
 
 
-class AsciiFollower(Robot):
+class OpenDuckMiniFollower(Robot):
     """
-    ASCII Follower Arm (clone of SO-101 Follower) for use with ASCII teleoperators.
+    OpenDuckMini Follower Arm 
     """
 
-    config_class = AsciiFollowerConfig
-    name = "ascii_follower"
+    config_class = OpenDuckMiniFollowerConfig
+    name = "openduckmini_follower"
 
-    def __init__(self, config: AsciiFollowerConfig):
+    def __init__(self, config: OpenDuckMiniFollowerConfig):
         super().__init__(config)
         self.config = config
         norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
         self.bus = FeetechMotorsBus(
             port=self.config.port,
             motors={
-                "right_shoulder_pan": Motor(1, "sts3215", norm_mode_body),
-                "right_shoulder_lift": Motor(2, "sts3215", norm_mode_body),
-                "right_elbow_flex": Motor(3, "sts3215", norm_mode_body),
-                "right_wrist_flex": Motor(4, "sts3215", norm_mode_body),
-                "right_wrist_roll": Motor(5, "sts3215", norm_mode_body),
-                "right_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
-                "left_shoulder_pan": Motor(7, "sts3215", norm_mode_body),
-                "left_shoulder_lift": Motor(8, "sts3215", norm_mode_body),
-                "left_elbow_flex": Motor(9, "sts3215", norm_mode_body),
-                "left_wrist_flex": Motor(10, "sts3215", norm_mode_body),
-                "left_wrist_roll": Motor(11, "sts3215", norm_mode_body),
-                "left_gripper": Motor(12, "sts3215", MotorNormMode.RANGE_0_100),
-                "waist_roll": Motor(13, "sts3215", norm_mode_body),
-                "waist_linear": Motor(14, "sts3215", norm_mode_body),
+                "right_hip_yaw": Motor(10, "sts3215", norm_mode_body),           # right_shoulder_pan 1
+                "right_hip_pitch": Motor(12, "sts3215", norm_mode_body),         # right_shoulder_lift 2
+                "right_knee": Motor(13, "sts3215", norm_mode_body),              # right_elbow_flex 3
+                "right_ankle": Motor(14, "sts3215", norm_mode_body),             # right_wrist_flex 4
+                "right_hip_roll": Motor(11, "sts3215", norm_mode_body),          # right_wrist_roll 5
+                "neck_pitch": Motor(30, "sts3215", MotorNormMode.RANGE_0_100),   # right_gripper 6
+                "left_hip_yaw": Motor(20, "sts3215", norm_mode_body),            # left_shoulder_pan 7
+                "left_hip_pitch": Motor(22, "sts3215", norm_mode_body),          # left_shoulder_lift 8
+                "left_knee": Motor(23, "sts3215", norm_mode_body),               # left_elbow_flex 9
+                "left_ankle": Motor(24, "sts3215", norm_mode_body),             # left_wrist_flex 10
+                "left_hip_roll": Motor(21, "sts3215", norm_mode_body),          # left_wrist_roll 11
+                "head_pitch": Motor(31, "sts3215", MotorNormMode.RANGE_0_100),  # left_gripper 12
+                "head_roll": Motor(33, "sts3215", norm_mode_body),              # waist_roll 13
+                "head_yaw": Motor(32, "sts3215", norm_mode_body),               # waist_linear 14
             },
             calibration=self.calibration,
         )
@@ -155,6 +155,9 @@ class AsciiFollower(Robot):
         print("Calibration saved to", self.calibration_fpath)
 
     def configure(self) -> None:
+        
+        safe_mode_enabled = False # limit torque and current for all motors during setup
+
         with self.bus.torque_disabled():
             self.bus.configure_motors()
             for motor in self.bus.motors:
@@ -165,7 +168,15 @@ class AsciiFollower(Robot):
                 self.bus.write("I_Coefficient", motor, 0)
                 self.bus.write("D_Coefficient", motor, 32)
 
-                if motor in ["left_gripper", "right_gripper", "waist_linear"]:
+                # if motor in ["left_gripper", "right_gripper", "waist_linear"]:
+                #     self.bus.write(
+                #         "Max_Torque_Limit", motor, 500
+                #     )  # 50% of the max torque limit to avoid burnout
+                #     self.bus.write("Protection_Current", motor, 250)  # 50% of max current to avoid burnout
+                #     self.bus.write("Overload_Torque", motor, 25)  # 25% torque when overloaded
+
+                if safe_mode_enabled:
+                    # limit torque for all motors
                     self.bus.write(
                         "Max_Torque_Limit", motor, 500
                     )  # 50% of the max torque limit to avoid burnout

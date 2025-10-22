@@ -193,3 +193,26 @@ huggingface-cli upload --repo-type dataset tinkerbuggy/cheese_slicer_fine C:\Use
 - good episodes: 2, 5, 9
 
 lerobot-replay --robot.type=ascii_follower --robot.port=COM11 --robot.id=ascii_follower --robot.calibration_dir="C:\Users\meets\Projects\solobot\lerobot"  --dataset.repo_id=tinkerbuggy/cheese_slicer_fine --dataset.episode=2  --dataset.root="C:\Users\meets\Projects\solobot\lerobot\tinkerbuggy\cheese_slicer_fine" 
+
+### download 40k model
+huggingface-cli download tinkerbuggy/cheese_slicer_fine_h100_40k --repo-type model --local-dir C:\Users\meets\.cache\huggingface\hub\models--tinkerbuggy--cheese_slicer_fine_h100_40k
+
+### run 40k model
+lerobot-record --robot.type=ascii_follower --robot.port=COM11 --robot.id=ascii_follower --robot.calibration_dir="C:\Users\meets\Projects\solobot\lerobot"  --robot.cameras="{ right: {type: opencv, index_or_path: 1, width: 1280, height: 720, fps: 30}, left: {type: opencv, index_or_path: 2, width: 1280, height: 720, fps: 30}}"  --dataset.repo_id=tinkerbuggy/eval_act_cheese_slicer_fine_h100_40k --dataset.num_episodes=1 --dataset.episode_time_s 300 --dataset.reset_time_s 30 --dataset.single_task="Slice Cheese" --dataset.root="C:\Users\meets\Projects\solobot\lerobot\tinkerbuggy\act_cheese_slicer_fine_h100_40k"  --display_data=true --policy.path=tinkerbuggy/cheese_slicer_fine_h100_40k
+
+- eval dataset path
+C:\Users\meets\Projects\solobot\lerobot\tinkerbuggy\act_cheese_slicer_fine_h100_40k
+
+
+### teleop
+python -m lerobot.teleoperate --robot.type=ascii_follower --robot.port=COM11 --robot.id=ascii_follower --robot.calibration_dir="C:\Users\meets\Projects\solobot\lerobot" --teleop.type=ascii_leader --teleop.port=COM8 --teleop.id=ascii_leader --teleop.calibration_dir="C:\Users\meets\Projects\solobot\lerobot"
+
+
+### run final model
+lerobot-record --robot.type=ascii_follower --robot.port=COM11 --robot.id=ascii_follower --robot.calibration_dir="C:\Users\meets\Projects\solobot\lerobot"  --robot.cameras="{ right: {type: opencv, index_or_path: 1, width: 1280, height: 720, fps: 30}, left: {type: opencv, index_or_path: 2, width: 1280, height: 720, fps: 30}}"  --dataset.repo_id=tinkerbuggy/eval_act_cheese_slicer_fine_h100 --dataset.num_episodes=1 --dataset.episode_time_s 300 --dataset.reset_time_s 30 --dataset.single_task="Slice Cheese" --dataset.root="C:\Users\meets\Projects\solobot\lerobot\tinkerbuggy\act_cheese_slicer_fine_h100"  --display_data=true --policy.path=tinkerbuggy/cheese_slicer_fine_h100
+
+- eval dataset path
+C:\Users\meets\Projects\solobot\lerobot\tinkerbuggy\act_cheese_slicer_fine_h100
+
+
+huggingface-cli download tinkerbuggy/cheese_slicer_fine_h100_80k --repo-type model --local-dir C:\Users\meets\.cache\huggingface\hub\models--tinkerbuggy--cheese_slicer_fine_h100_80k

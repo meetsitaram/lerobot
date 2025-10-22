@@ -29,6 +29,11 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> Teleoperator:
         from .ascii_leader import AsciiLeader
 
         return AsciiLeader(config)
+    
+    elif config.type == "openduckmini_leader":
+        from .openduckmini_leader import OpenDuckMiniLeader
+
+        return OpenDuckMiniLeader(config)
     elif config.type == "so100_leader":
         from .so100_leader import SO100Leader
 
