@@ -165,8 +165,9 @@ class KochLeader(Teleoperator):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
+        # Read with retries for more stable communication
         start = time.perf_counter()
-        action = self.bus.sync_read("Present_Position")
+        action = self.bus.sync_read("Present_Position", num_retry=3)
         action = {f"{motor}.pos": val for motor, val in action.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")
