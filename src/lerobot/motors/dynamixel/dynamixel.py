@@ -183,7 +183,7 @@ class DynamixelMotorsBus(MotorsBus):
         # By default, Dynamixel motors have a 500µs delay response time (corresponding to a value of 250 on
         # the 'Return_Delay_Time' address). We ensure this is reduced to the minimum of 2µs (value of 0).
         for motor in self.motors:
-            self.write("Return_Delay_Time", motor, return_delay_time)
+            self.write("Return_Delay_Time", motor, return_delay_time, num_retry=3)
 
     @property
     def is_calibrated(self) -> bool:
@@ -209,10 +209,11 @@ class DynamixelMotorsBus(MotorsBus):
         return calibration
 
     def write_calibration(self, calibration_dict: dict[str, MotorCalibration], cache: bool = True) -> None:
+        # Use retries for more stable calibration writes
         for motor, calibration in calibration_dict.items():
-            self.write("Homing_Offset", motor, calibration.homing_offset)
-            self.write("Min_Position_Limit", motor, calibration.range_min)
-            self.write("Max_Position_Limit", motor, calibration.range_max)
+            self.write("Homing_Offset", motor, calibration.homing_offset, num_retry=3)
+            self.write("Min_Position_Limit", motor, calibration.range_min, num_retry=3)
+            self.write("Max_Position_Limit", motor, calibration.range_max, num_retry=3)
 
         if cache:
             self.calibration = calibration_dict
