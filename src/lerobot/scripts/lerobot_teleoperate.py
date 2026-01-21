@@ -77,6 +77,7 @@ from lerobot.robots import (  # noqa: F401
     make_robot_from_config,
     omx_follower,
     reachy2,
+    realman_follower,
     so_follower,
 )
 from lerobot.teleoperators import (  # noqa: F401
