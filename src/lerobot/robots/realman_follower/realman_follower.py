@@ -142,6 +142,27 @@ class RealManFollower(Robot):
         self._last_joint_read_time = 0.0  # Time of last joint read
         
         logger.info(f"Initialized RealManFollower for {config.model} at {config.ip}:{config.port}")
+        if config.invert_joints:
+            msg = f"Joint inversions configured: {config.invert_joints}"
+            logger.info(msg)
+            print(f"🔄 {msg}")  # Also print to ensure it's visible
+        
+        # Check for min_z_position - use calibration value as fallback if config not set
+        effective_min_z = config.min_z_position
+        if effective_min_z is None and self.calibration.get("min_z_position"):
+            effective_min_z = self.calibration["min_z_position"]
+            # Store it in a runtime attribute so send_action can use it
+            self._effective_min_z = effective_min_z
+            msg = f"Z safety limit from calibration: min_z={effective_min_z:.3f}m, action={config.z_limit_action}"
+            logger.info(msg)
+            print(f"🛡️ {msg}")
+        elif effective_min_z is not None:
+            self._effective_min_z = effective_min_z
+            msg = f"Z safety limit from config: min_z={effective_min_z:.3f}m, action={config.z_limit_action}"
+            logger.info(msg)
+            print(f"🛡️ {msg}")
+        else:
+            self._effective_min_z = None
 
     def _load_calibration(self, fpath: Path | None = None) -> None:
         """Load RealMan calibration (home position) from file."""
@@ -162,15 +183,14 @@ class RealManFollower(Robot):
         logger.info(f"Calibration saved to {fpath}")
 
     def _get_robot_controller(self):
-        """Lazy import and create RobotController from realman_teleop."""
+        """Lazy import and create RobotController from local module."""
         if self._robot_controller is None:
             try:
-                from realman_teleop import RobotController
+                from .robot_controller import RobotController
             except ImportError as e:
                 raise ImportError(
-                    "realman_teleop package not found. Please install it:\n"
-                    "  pip install -e /path/to/realman-teleop\n"
-                    "or ensure the package is in your Python path."
+                    "RobotController module not found. This is a required component of realman_follower.\n"
+                    "Please ensure robot_controller.py exists in the realman_follower directory."
                 ) from e
             
             self._robot_controller = RobotController(
@@ -322,20 +342,78 @@ class RealManFollower(Robot):
         print("=" * 60)
         print("\nThis calibration will record joint positions to map properly")
         print("with the SO101 leader arm.\n")
+        print("📊 Real-time joint positions will be displayed while you move the arm.")
+        print("   Press ENTER when the arm is in the desired position.\n")
+        
+        def wait_with_live_positions(prompt: str, highlight_joint: int = None) -> list[float]:
+            """Wait for user input while showing live joint positions and end effector Z."""
+            import sys
+            import select
+            import termios
+            import tty
+            
+            print(prompt)
+            print("   (Positions update in real-time. Press ENTER when ready)")
+            print()
+            
+            # Save terminal settings
+            old_settings = termios.tcgetattr(sys.stdin)
+            try:
+                # Set terminal to raw mode for non-blocking input
+                tty.setcbreak(sys.stdin.fileno())
+                
+                while True:
+                    # Check for keypress (non-blocking)
+                    if select.select([sys.stdin], [], [], 0.1)[0]:
+                        key = sys.stdin.read(1)
+                        if key == '\n' or key == '\r':
+                            break
+                    
+                    # Get current joint positions
+                    positions = robot.get_current_joint_angles()
+                    # Get current end effector pose for Z display
+                    ee_pose = robot.get_current_pose()
+                    
+                    if positions:
+                        # Build position display string
+                        pos_strs = []
+                        for i, pos in enumerate(positions):
+                            joint_name = f"J{i+1}"
+                            if highlight_joint is not None and i == highlight_joint:
+                                # Highlight the joint being calibrated
+                                pos_strs.append(f"[{joint_name}:{pos:+7.2f}°]")
+                            else:
+                                pos_strs.append(f"{joint_name}:{pos:+7.2f}°")
+                        
+                        # Add end effector Z position
+                        z_str = f"Z={ee_pose[2]:.3f}m" if ee_pose else "Z=?.???m"
+                        
+                        # Print on same line (carriage return)
+                        print(f"\r   📍 {' | '.join(pos_strs)} | 🎯 {z_str}   ", end='', flush=True)
+                
+                print()  # New line after ENTER
+                return robot.get_current_joint_angles()
+            finally:
+                # Restore terminal settings
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
         
         # Step 1: Record center position
         print("STEP 1: CENTER POSITION")
         print("-" * 40)
-        print("Move the RealMan arm to its CENTER/HOME position.")
-        print("This should match where SO101 outputs 0 for all joints.")
-        input("Press ENTER when ready...")
-        
-        center_pos = robot.get_current_joint_angles()
+        center_pos = wait_with_live_positions(
+            "Move the RealMan arm to its CENTER/HOME position.\n"
+            "This should match where SO101 outputs 0 for all joints."
+        )
         if center_pos is None:
             logger.error("Failed to read joint positions")
             return
         
-        print(f"Center position recorded: {[f'{p:.1f}°' for p in center_pos]}")
+        print(f"✅ Center joint positions recorded: {[f'{p:.1f}°' for p in center_pos]}")
+        
+        # Also record center end effector position for Z safety checks
+        center_ee_pose = robot.get_current_pose()
+        if center_ee_pose:
+            print(f"✅ Center end effector position: X={center_ee_pose[0]:.3f}m, Y={center_ee_pose[1]:.3f}m, Z={center_ee_pose[2]:.3f}m")
         
         # Step 2: Record min/max for each mapped joint
         print("\nSTEP 2: JOINT RANGES")
@@ -357,23 +435,30 @@ class RealManFollower(Robot):
         for so101_name, realman_idx, realman_name in joints_to_calibrate:
             print(f"\n--- Calibrating {realman_name} (maps to SO101 {so101_name}) ---")
             
-            input(f"Move {realman_name} to its MINIMUM position, then press ENTER...")
-            min_pos = robot.get_current_joint_angles()
+            min_pos = wait_with_live_positions(
+                f"Move {realman_name} to its MINIMUM position",
+                highlight_joint=realman_idx
+            )
             if min_pos is None:
                 logger.error("Failed to read joint positions")
                 return
             min_val = min_pos[realman_idx]
+            print(f"   📌 MIN recorded: {min_val:.2f}°")
             
-            input(f"Move {realman_name} to its MAXIMUM position, then press ENTER...")
-            max_pos = robot.get_current_joint_angles()
+            max_pos = wait_with_live_positions(
+                f"Move {realman_name} to its MAXIMUM position",
+                highlight_joint=realman_idx
+            )
             if max_pos is None:
                 logger.error("Failed to read joint positions")
                 return
             max_val = max_pos[realman_idx]
+            print(f"   📌 MAX recorded: {max_val:.2f}°")
             
             # Ensure min < max
             if min_val > max_val:
                 min_val, max_val = max_val, min_val
+                print("   ⚠️  Swapped min/max (min was greater than max)")
             
             joint_ranges[realman_name] = {
                 "min": min_val,
@@ -383,11 +468,12 @@ class RealManFollower(Robot):
                 "realman_idx": realman_idx,
             }
             
-            print(f"  {realman_name}: [{min_val:.1f}°, {max_val:.1f}°], center: {center_pos[realman_idx]:.1f}°")
+            print(f"   ✅ {realman_name}: [{min_val:.1f}°, {max_val:.1f}°], center: {center_pos[realman_idx]:.1f}°")
         
         # Save calibration
         self.calibration = {
-            "home_position": center_pos,
+            "home_position": center_pos,  # Joint angles at center position
+            "center_ee_pose": center_ee_pose,  # End effector Cartesian pose [x, y, z, rx, ry, rz]
             "joint_ranges": joint_ranges,
         }
         self._save_calibration()
@@ -401,6 +487,108 @@ class RealManFollower(Robot):
         input("\nPress ENTER to move robot back to center position...")
         robot.movej(center_pos, velocity=self.config.velocity, block=True)
         print("Robot at center position.")
+        
+        # Step 3: Configure Z safety limit
+        print("\n" + "=" * 60)
+        print("STEP 3: Z SAFETY LIMIT (Optional)")
+        print("=" * 60)
+        print("\nSet a minimum Z height to prevent the arm from going too low.")
+        print("This protects against collisions with the table/workspace.\n")
+        
+        current_pose = robot.get_current_pose()
+        current_z = current_pose[2] if current_pose else 0.0
+        print(f"   Current end effector Z position: {current_z:.3f}m")
+        print(f"   Current min_z_position config:   {self.config.min_z_position}")
+        
+        print("\nOptions:")
+        print("   1. Move arm to the LOWEST safe position, then press 1")
+        print("   2. Enter a custom Z value (in meters)")
+        print("   3. Keep current config / skip (press ENTER)")
+        
+        choice = input("\nChoice [1/2/ENTER]: ").strip()
+        
+        if choice == "1":
+            print("\n🔧 INTERACTIVE Z LIMIT CALIBRATION")
+            print("-" * 40)
+            print("Move the end effector DOWN until it is just a few millimeters")
+            print("ABOVE the table/ground surface. This position will be used as")
+            print("the safety limit to prevent collisions.")
+            print("")
+            print("💡 TIP: Position the gripper ~5-10mm above the table surface.")
+            
+            # Show live Z position while user moves the arm
+            import sys
+            import select
+            import termios
+            import tty
+            
+            print("\n   (Z position updates in real-time. Press ENTER when positioned)")
+            old_settings = termios.tcgetattr(sys.stdin)
+            try:
+                tty.setcbreak(sys.stdin.fileno())
+                while True:
+                    if select.select([sys.stdin], [], [], 0.1)[0]:
+                        key = sys.stdin.read(1)
+                        if key == '\n' or key == '\r':
+                            break
+                    
+                    pose = robot.get_current_pose()
+                    if pose:
+                        z_mm = pose[2] * 1000  # Convert to mm for easier reading
+                        print(f"\r   🎯 Current Z: {pose[2]:.4f}m ({z_mm:.1f}mm)   ", end='', flush=True)
+                
+                print()
+            finally:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            
+            # Record the Z position
+            final_pose = robot.get_current_pose()
+            if final_pose:
+                recorded_z = final_pose[2]
+                recorded_z_mm = recorded_z * 1000
+                
+                print(f"\n   📌 Recorded end effector Z: {recorded_z:.4f}m ({recorded_z_mm:.1f}mm)")
+                
+                # Ask for additional safety margin
+                print("\n   How much ADDITIONAL safety margin would you like? (default: 0mm)")
+                print("   This will be added to the recorded position.")
+                margin_input = input("   Enter margin in mm [0]: ").strip()
+                
+                try:
+                    margin_mm = float(margin_input) if margin_input else 0.0
+                except ValueError:
+                    margin_mm = 0.0
+                    print("   (Invalid input, using 0mm margin)")
+                
+                margin_m = margin_mm / 1000.0
+                min_z_final = recorded_z + margin_m
+                min_z_final_mm = min_z_final * 1000
+                
+                print(f"\n   📐 Recorded Z:      {recorded_z:.4f}m ({recorded_z_mm:.1f}mm)")
+                print(f"   📐 Safety margin:  +{margin_m:.4f}m ({margin_mm:.1f}mm)")
+                print(f"   📐 Final min_z:     {min_z_final:.4f}m ({min_z_final_mm:.1f}mm)")
+                
+                # Save to calibration
+                self.calibration["min_z_position"] = min_z_final
+                self._save_calibration()
+                
+                print(f"\n   ✅ min_z_position saved to calibration file!")
+                print(f"\n   ⚠️  To ENABLE this limit during teleoperation, update realman_config.yaml:")
+                print(f"       safety:")
+                print(f"         min_z_position: {min_z_final:.4f}")
+        
+        elif choice == "2":
+            try:
+                custom_z = float(input("   Enter min Z value (meters, e.g., 0.05): ").strip())
+                self.calibration["min_z_position"] = custom_z
+                self._save_calibration()
+                print(f"\n   ✅ min_z_position saved to calibration file: {custom_z:.4f}m")
+                print(f"   ⚠️  To enable, also set 'min_z_position: {custom_z:.3f}' in realman_config.yaml")
+            except ValueError:
+                print("   ❌ Invalid input, skipping Z limit configuration.")
+        
+        else:
+            print("   ⏭️  Skipped Z safety limit configuration.")
 
     def configure(self) -> None:
         """Apply runtime configuration to the robot."""
@@ -482,9 +670,23 @@ class RealManFollower(Robot):
         # Clamp input to valid range
         normalized_value = max(-100.0, min(100.0, normalized_value))
         
+        # Check if joint should be inverted
+        joint_name = REALMAN_JOINT_NAMES[realman_idx]
+        should_invert = self.config.invert_joints.get(joint_name, False)
+        if should_invert:
+            original_value = normalized_value
+            normalized_value = -normalized_value
+            msg = f"🔄 Inverting {so101_name} ({joint_name}): {original_value:+6.1f} -> {normalized_value:+6.1f}"
+            logger.debug(msg)
+            # Print first few times for visibility
+            if not hasattr(self, '_invert_print_count'):
+                self._invert_print_count = {}
+            if self._invert_print_count.get(joint_name, 0) < 3:
+                print(msg)
+                self._invert_print_count[joint_name] = self._invert_print_count.get(joint_name, 0) + 1
+        
         # Check if we have RealMan calibration data
         if self.calibration and "joint_ranges" in self.calibration:
-            joint_name = REALMAN_JOINT_NAMES[realman_idx]
             joint_cal = self.calibration["joint_ranges"].get(joint_name)
             if joint_cal:
                 min_deg = joint_cal["min"]
@@ -499,6 +701,12 @@ class RealManFollower(Robot):
                 else:
                     # Map 0..100 to center_deg..max_deg
                     degrees = center_deg + (normalized_value / 100.0) * (max_deg - center_deg)
+                
+                logger.debug(
+                    f"SO101→RealMan {so101_name}({joint_name}): "
+                    f"norm={normalized_value:+6.1f} → deg={degrees:+7.2f}° "
+                    f"[range: {min_deg:+6.1f}° to {max_deg:+6.1f}°, center={center_deg:+6.1f}°]"
+                )
                 
                 return degrees
         
@@ -529,9 +737,10 @@ class RealManFollower(Robot):
         if so101_name is None:
             return degrees
         
+        joint_name = REALMAN_JOINT_NAMES[realman_idx]
+        
         # Check if we have RealMan calibration data
         if self.calibration and "joint_ranges" in self.calibration:
-            joint_name = REALMAN_JOINT_NAMES[realman_idx]
             joint_cal = self.calibration["joint_ranges"].get(joint_name)
             if joint_cal:
                 min_deg = joint_cal["min"]
@@ -554,6 +763,21 @@ class RealManFollower(Robot):
                         normalized = 100.0 * (degrees - center_deg) / (max_deg - center_deg)
                     else:
                         normalized = 0.0
+                
+                # Apply inversion if configured
+                should_invert = self.config.invert_joints.get(joint_name, False)
+                if should_invert:
+                    original_normalized = normalized
+                    normalized = -normalized
+                    logger.debug(
+                        f"RealMan→SO101 {joint_name}: "
+                        f"deg={degrees:+7.2f}° → norm={original_normalized:+6.1f} (inverted→{normalized:+6.1f})"
+                    )
+                else:
+                    logger.debug(
+                        f"RealMan→SO101 {joint_name}: "
+                        f"deg={degrees:+7.2f}° → norm={normalized:+6.1f}"
+                    )
                 
                 return normalized
         
@@ -737,6 +961,22 @@ class RealManFollower(Robot):
         # Convert SO101 action to RealMan format
         target_joints, gripper_pos = self._convert_so101_action_to_realman(action)
         
+        # Log the action mapping summary
+        action_summary = []
+        for so101_name, realman_idx in SO101_TO_REALMAN_JOINT_MAP.items():
+            key = f"{so101_name}.pos"
+            if key in action:
+                action_summary.append(f"{so101_name}={action[key]:+6.1f}→{target_joints[realman_idx]:+7.2f}°")
+        if action_summary:
+            msg = f"Action: {', '.join(action_summary)}"
+            logger.debug(msg)
+            # Print first few actions for visibility
+            if not hasattr(self, '_action_print_count'):
+                self._action_print_count = 0
+            if self._action_print_count < 5:
+                print(f"📤 {msg}")
+                self._action_print_count += 1
+        
         # Apply safety limits if configured - use cached joint angles for speed
         if self.config.max_relative_target is not None:
             current_joints = self._last_joint_angles
@@ -752,6 +992,60 @@ class RealManFollower(Robot):
                         if abs(delta) > max_delta:
                             target_joints[i] = current_joints[i] + max_delta * (1 if delta > 0 else -1)
                             logger.debug(f"Clamped joint {i} delta from {delta:.2f} to {max_delta}")
+        
+        # Check Z position safety limit if configured (from config or calibration)
+        effective_min_z = getattr(self, '_effective_min_z', None)
+        if effective_min_z is not None:
+            current_pose = robot.get_current_pose()
+            if current_pose:
+                current_z = current_pose[2]  # Z is the 3rd element [x, y, z, rx, ry, rz]
+                min_z = effective_min_z
+                
+                # Track the last "safe" joint positions (when Z was above limit)
+                if not hasattr(self, '_last_safe_joints'):
+                    self._last_safe_joints = list(target_joints)
+                    self._last_safe_z = current_z
+                
+                if current_z > min_z:
+                    # ABOVE limit - update safe position and clear warning
+                    self._last_safe_joints = list(self._last_joint_angles or target_joints)
+                    self._last_safe_z = current_z
+                    if hasattr(self, '_z_limit_active'):
+                        del self._z_limit_active
+                        print(f"✅ Z limit cleared: Z={current_z:.3f}m")
+                else:
+                    # AT or BELOW limit - enforce safety
+                    if not hasattr(self, '_z_limit_active'):
+                        self._z_limit_active = True
+                        logger.warning(
+                            f"⚠️ Z position safety limit! Z={current_z:.3f}m, Limit={min_z:.3f}m"
+                        )
+                        print(f"⚠️ Z SAFETY: Z={current_z:.3f}m at limit ({min_z:.3f}m)")
+                    
+                    # REACTIVE SAFETY: Use last safe joints as base, but allow upward motion
+                    # Compare target Z tendency: if moving joints would lower Z, use safe joints
+                    # Since we can't predict FK, we use the safe joints as the command
+                    # but allow individual joints to move if they're moving AWAY from limit direction
+                    
+                    if self._last_safe_joints:
+                        # Blend: use safe joints as baseline
+                        safe_joints = self._last_safe_joints
+                        
+                        # Allow joints to move ONLY if they would increase Z
+                        # Heuristic: joints 1,2,3 (shoulder/elbow) most affect Z
+                        # If current Z is at limit, only allow joint changes that 
+                        # moved us UP last time
+                        
+                        # Simple approach: hold position at safe joints
+                        # but allow small movements to test if Z increases
+                        for i in range(len(target_joints)):
+                            delta = target_joints[i] - safe_joints[i]
+                            # Allow small movements (< 2 degrees) to "feel" for safe direction
+                            if abs(delta) > 2.0:
+                                target_joints[i] = safe_joints[i] + (2.0 if delta > 0 else -2.0)
+                        
+                        # After this limited movement, the next cycle will check Z again
+                        # If Z improved, safe_joints will update; if not, we stay clamped
         
         # Send joint command using CANFD for low-latency teleoperation
         # follow=False means immediately override current motion (better responsiveness)

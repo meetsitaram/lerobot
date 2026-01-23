@@ -137,6 +137,18 @@ class RealManFollowerConfig(RobotConfig):
     # Whether to strictly enforce joint limits (recommended: True)
     enforce_joint_limits: bool = True
 
+    # Invert mapping for specific joints (useful when SO101 and RealMan rotate in opposite directions)
+    # Key is RealMan joint name (e.g., "joint_1"), value is True to invert
+    invert_joints: dict[str, bool] = field(default_factory=dict)
+
+    # Minimum Z position (meters) for end effector safety
+    # Set to None to disable, or a float value (e.g., 0.05 = 5cm above table)
+    # This prevents the arm from going below this Z height relative to base
+    min_z_position: float | None = None
+    
+    # Action to take when Z limit would be violated: "clamp" or "reject"
+    z_limit_action: str = "clamp"
+
     def __post_init__(self):
         super().__post_init__()
         
