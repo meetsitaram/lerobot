@@ -73,9 +73,6 @@ def get_cv2_rotation(rotation: Cv2Rotation) -> int | None:
 def get_cv2_backend() -> int:
     import cv2
 
-    if platform.system() == "Windows":
-        return int(cv2.CAP_MSMF)  # Use MSMF for Windows instead of AVFOUNDATION
-    # elif platform.system() == "Darwin":  # macOS
-    #     return cv2.CAP_AVFOUNDATION
-    else:  # Linux and others
-        return int(cv2.CAP_ANY)
+    # Use CAP_ANY to let OpenCV auto-detect the best backend for each camera
+    # This works across all platforms and camera types (DSHOW, MSMF, etc.)
+    return int(cv2.CAP_ANY)
