@@ -15,3 +15,9 @@
 from .camera import Camera
 from .configs import CameraConfig, ColorMode, Cv2Rotation
 from .utils import make_cameras_from_configs
+
+# Import synthetic camera config for convenience (lazy import to avoid hard dependency)
+try:
+    from .synthetic import SyntheticCameraConfig
+except ImportError:
+    SyntheticCameraConfig = None  # synthetic-camera package not installed

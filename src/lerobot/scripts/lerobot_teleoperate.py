@@ -60,6 +60,10 @@ import rerun as rr
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+try:
+    from lerobot.cameras.synthetic.configuration_synthetic import SyntheticCameraConfig  # noqa: F401
+except ImportError:
+    pass  # synthetic-camera package not installed
 from lerobot.configs import parser
 from lerobot.processor import (
     RobotAction,

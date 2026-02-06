@@ -62,6 +62,15 @@ class SOFollower(Robot):
             calibration=self.calibration,
         )
         self.cameras = make_cameras_from_configs(config.cameras)
+        
+        # Inject robot reference into synthetic cameras (they need it for joint rendering)
+        self._inject_robot_into_synthetic_cameras()
+
+    def _inject_robot_into_synthetic_cameras(self) -> None:
+        """Inject robot reference into any synthetic cameras for joint rendering."""
+        for cam in self.cameras.values():
+            if hasattr(cam, 'set_robot'):
+                cam.set_robot(self)
 
     @property
     def _motors_ft(self) -> dict[str, type]:
