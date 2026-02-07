@@ -353,6 +353,16 @@ def record_loop(
         preprocessor.reset()
         postprocessor.reset()
 
+    # Set task filter on the Scene for synthetic cameras (task-focused rendering)
+    # The Scene handles planning/filtering - cameras are task-agnostic
+    if single_task:
+        try:
+            from synthetic_camera.planning import set_task
+            set_task(single_task)
+            logging.info(f"Set task filter on SyntheticScene: '{single_task}'")
+        except ImportError:
+            pass  # synthetic-camera package not installed
+
     timestamp = 0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
@@ -600,7 +610,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if not is_headless() and listener:
             listener.stop()
 
-        if cfg.dataset.push_to_hub:
+        if dataset and cfg.dataset.push_to_hub:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
         log_say("Exiting", cfg.play_sounds)

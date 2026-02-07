@@ -144,35 +144,27 @@ class SyntheticCamera(Camera):
         
         # Build renderer config
         if self.config.config_dir:
+            # Load ALL settings from YAML files - scene_config.yaml is the source of truth
+            # for detection settings (prompt, confidence, etc.)
             renderer_config = SyntheticViewConfig.from_yaml(self.config.config_dir)
+            
+            # Only override camera-specific settings, NOT detection settings!
+            # Detection prompt/confidence come from scene_config.yaml
             renderer_config.camera_ids = self.config.camera_ids or renderer_config.camera_ids
             renderer_config.camera_width = self.config.camera_resolution[0]
             renderer_config.camera_height = self.config.camera_resolution[1]
             renderer_config.camera_fps = self.fps
-            renderer_config.detection_prompt = self.config.detection_prompt
-            renderer_config.detection_confidence = self.config.detection_confidence
-            renderer_config.detection_device = self.config.detection_device
             renderer_config.view_width = self.width
             renderer_config.view_height = self.height
             renderer_config.ortho_scale = self.config.ortho_scale
             renderer_config.joint_read_rate_hz = self.config.joint_read_rate_hz
+            # detection_prompt, detection_confidence, detection_device
+            # are loaded from scene_config.yaml by from_yaml() - DO NOT override!
         else:
-            renderer_config = SyntheticViewConfig(
-                camera_ids=self.config.camera_ids or [6, 4, 2],
-                camera_width=self.config.camera_resolution[0],
-                camera_height=self.config.camera_resolution[1],
-                camera_fps=self.fps,
-                detection_prompt=self.config.detection_prompt,
-                detection_confidence=self.config.detection_confidence,
-                detection_device=self.config.detection_device,
-                robot_x_cm=self.config.robot_offset_cm[0],
-                robot_y_cm=self.config.robot_offset_cm[1],
-                robot_z_cm=self.config.robot_offset_cm[2],
-                camera_tilt_deg=self.config.camera_tilt_deg,
-                view_width=self.width,
-                view_height=self.height,
-                ortho_scale=self.config.ortho_scale,
-                joint_read_rate_hz=self.config.joint_read_rate_hz,
+            # config_dir is required - detection settings must come from scene_config.yaml
+            raise ValueError(
+                "config_dir is required for SyntheticCamera. "
+                "All detection settings are loaded from scene_config.yaml."
             )
         
         # Get shared renderer

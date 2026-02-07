@@ -24,10 +24,10 @@ class SyntheticCameraConfig(CameraConfig):
         ```python
         from lerobot.cameras.synthetic import SyntheticCameraConfig
         
+        # Detection prompt is loaded from scene_config.yaml by default
         config = SyntheticCameraConfig(
             view="front",
             config_dir="/path/to/synthetic-camera/config",
-            detection_prompt="orange",
         )
         ```
     
@@ -70,9 +70,9 @@ class SyntheticCameraConfig(CameraConfig):
     # Real camera resolution
     camera_resolution: Tuple[int, int] = (1280, 720)
     
-    # Detection settings
-    detection_prompt: str = "orange"
-    detection_confidence: float = 0.3
+    # Detection settings (None = use scene_config.yaml defaults)
+    detection_prompt: Optional[str] = None  # If None, uses scene_config.yaml
+    detection_confidence: Optional[float] = None  # If None, uses scene_config.yaml
     detection_device: Optional[str] = None  # None for auto (CUDA if available)
     
     # Robot offset from calibration origin [x, y, z] in centimeters
