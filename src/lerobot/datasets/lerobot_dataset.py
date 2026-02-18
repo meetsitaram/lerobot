@@ -1688,6 +1688,90 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         # per robot.
         self.stats = aggregate_stats([dataset.meta.stats for dataset in self._datasets])
 
+        # Build a combined meta-like object for training pipeline compatibility
+        self._meta = self._build_meta()
+
+    def _build_meta(self):
+        """Build a meta-compatible object for the training pipeline."""
+
+        class _MultiMeta:
+            pass
+
+        meta = _MultiMeta()
+        meta.stats = self.stats
+
+        # Use first dataset's info as base (fps, codebase_version, etc.)
+        meta.info = dict(self._datasets[0].meta.info)
+
+        # Merge features: intersection of all datasets' features
+        intersection_features = {}
+        first_features = self._datasets[0].meta.features
+        for key, ft in first_features.items():
+            if key not in self.disabled_features:
+                intersection_features[key] = ft
+        meta.info["features"] = intersection_features
+
+        # features property
+        meta.features = intersection_features
+
+        # camera_keys derived from features
+        meta.camera_keys = [
+            key for key, ft in intersection_features.items() if ft.get("dtype") in ["video", "image"]
+        ]
+
+        # Merge tasks from all datasets
+        merged_tasks = {}
+        for ds in self._datasets:
+            if hasattr(ds.meta, "tasks") and ds.meta.tasks is not None:
+                try:
+                    if hasattr(ds.meta.tasks, "empty"):
+                        # DataFrame
+                        if not ds.meta.tasks.empty:
+                            for _, row in ds.meta.tasks.iterrows():
+                                task_idx = row.get("task_index", len(merged_tasks))
+                                task_desc = row.get("task", "")
+                                merged_tasks[task_idx] = task_desc
+                    elif isinstance(ds.meta.tasks, dict):
+                        merged_tasks.update(ds.meta.tasks)
+                except Exception:
+                    pass
+        meta.tasks = merged_tasks
+
+        # Build concatenated episodes table (needed by EpisodeAwareSampler)
+        # Each episode needs dataset_from_index and dataset_to_index
+        episodes_list = []
+        offset = 0
+        for ds in self._datasets:
+            if hasattr(ds.meta, "episodes") and ds.meta.episodes is not None:
+                for ep in ds.meta.episodes:
+                    ep_copy = dict(ep)
+                    ep_copy["dataset_from_index"] = ep.get("dataset_from_index", 0) + offset
+                    ep_copy["dataset_to_index"] = ep.get("dataset_to_index", 0) + offset
+                    episodes_list.append(ep_copy)
+                offset += ds.num_frames
+        meta.episodes = episodes_list
+
+        # fps
+        meta.fps = self._datasets[0].meta.info["fps"]
+
+        # total_frames
+        meta.total_frames = sum(d.num_frames for d in self._datasets)
+
+        # subtasks
+        meta.subtasks = None
+
+        return meta
+
+    @property
+    def meta(self):
+        """Compatible meta object for training pipeline."""
+        return self._meta
+
+    @property
+    def episodes(self):
+        """Episode indices for sampler compatibility."""
+        return list(range(self.num_episodes))
+
     @property
     def repo_id_to_index(self):
         """Return a mapping from dataset repo_id to a dataset index automatically created by this class.
