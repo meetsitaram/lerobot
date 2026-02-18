@@ -84,6 +84,16 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
 
+    # Handle repo_id that may be a list passed as a string from CLI (e.g. '["a/b", "c/d"]')
+    repo_id = cfg.dataset.repo_id
+    if isinstance(repo_id, str) and repo_id.strip().startswith("["):
+        import ast
+        try:
+            repo_id = ast.literal_eval(repo_id)
+            cfg.dataset.repo_id = repo_id
+        except (ValueError, SyntaxError):
+            pass  # Keep as string if parsing fails
+
     if isinstance(cfg.dataset.repo_id, str):
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
