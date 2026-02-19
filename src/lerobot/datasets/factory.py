@@ -142,22 +142,51 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
             multi_image_transforms = resize_tf
 
         pre_built_datasets = []
+        skipped_datasets = []
         for repo_id in cfg.dataset.repo_id:
-            ds_meta = LeRobotDatasetMetadata(
-                repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
+            try:
+                ds_meta = LeRobotDatasetMetadata(
+                    repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
+                )
+                dt = resolve_delta_timestamps(cfg.policy, ds_meta)
+                ds = LeRobotDataset(
+                    repo_id,
+                    root=multi_root / repo_id,
+                    episodes=cfg.dataset.episodes,
+                    delta_timestamps=dt,
+                    image_transforms=multi_image_transforms,
+                    revision=cfg.dataset.revision,
+                    video_backend=cfg.dataset.video_backend,
+                    tolerance_s=cfg.tolerance_s,
+                )
+                # Quick sanity check: try accessing the first item
+                try:
+                    _ = ds[0]
+                except (IndexError, KeyError) as e:
+                    logging.warning(
+                        f"Dataset '{repo_id}' failed sanity check (first item access): {e}. Skipping."
+                    )
+                    skipped_datasets.append((repo_id, str(e)))
+                    continue
+                pre_built_datasets.append(ds)
+            except Exception as e:
+                logging.warning(
+                    f"Failed to load dataset '{repo_id}': {e}. Skipping this dataset."
+                )
+                skipped_datasets.append((repo_id, str(e)))
+                continue
+
+        if skipped_datasets:
+            logging.warning(
+                f"Skipped {len(skipped_datasets)} dataset(s) due to errors:\n"
+                + "\n".join(f"  - {rid}: {err}" for rid, err in skipped_datasets)
             )
-            dt = resolve_delta_timestamps(cfg.policy, ds_meta)
-            ds = LeRobotDataset(
-                repo_id,
-                root=multi_root / repo_id,
-                episodes=cfg.dataset.episodes,
-                delta_timestamps=dt,
-                image_transforms=multi_image_transforms,
-                revision=cfg.dataset.revision,
-                video_backend=cfg.dataset.video_backend,
-                tolerance_s=cfg.tolerance_s,
+
+        if not pre_built_datasets:
+            raise RuntimeError(
+                "All datasets failed to load! Cannot proceed with training. "
+                f"Skipped: {[r for r, _ in skipped_datasets]}"
             )
-            pre_built_datasets.append(ds)
 
         dataset = MultiLeRobotDataset._from_datasets(
             pre_built_datasets, image_transforms=image_transforms
