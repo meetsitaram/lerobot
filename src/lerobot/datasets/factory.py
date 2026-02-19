@@ -122,12 +122,31 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 tolerance_s=cfg.tolerance_s,
             )
     else:
-        # Multi-dataset support: create MultiLeRobotDataset from list of repo_ids
-        dataset = MultiLeRobotDataset(
-            cfg.dataset.repo_id,
-            root=cfg.dataset.root,
-            image_transforms=image_transforms,
-            video_backend=cfg.dataset.video_backend,
+        # Multi-dataset support: build each dataset with its own FPS-appropriate delta_timestamps
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+        from pathlib import Path
+
+        multi_root = Path(cfg.dataset.root) if cfg.dataset.root else HF_LEROBOT_HOME
+        pre_built_datasets = []
+        for repo_id in cfg.dataset.repo_id:
+            ds_meta = LeRobotDatasetMetadata(
+                repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
+            )
+            dt = resolve_delta_timestamps(cfg.policy, ds_meta)
+            ds = LeRobotDataset(
+                repo_id,
+                root=multi_root / repo_id,
+                episodes=cfg.dataset.episodes,
+                delta_timestamps=dt,
+                image_transforms=image_transforms,
+                revision=cfg.dataset.revision,
+                video_backend=cfg.dataset.video_backend,
+                tolerance_s=cfg.tolerance_s,
+            )
+            pre_built_datasets.append(ds)
+
+        dataset = MultiLeRobotDataset._from_datasets(
+            pre_built_datasets, image_transforms=image_transforms
         )
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "

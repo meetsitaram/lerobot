@@ -1691,6 +1691,46 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
         # Build a combined meta-like object for training pipeline compatibility
         self._meta = self._build_meta()
 
+    @classmethod
+    def _from_datasets(
+        cls,
+        datasets: list,
+        image_transforms=None,
+    ):
+        """Create a MultiLeRobotDataset from pre-built LeRobotDataset instances.
+
+        This is useful when each dataset needs different delta_timestamps (e.g., different FPS).
+        """
+        obj = cls.__new__(cls)
+        torch.utils.data.Dataset.__init__(obj)
+        obj.repo_ids = [ds.repo_id for ds in datasets]
+        obj.root = datasets[0].root.parent if datasets else None
+        obj.tolerances_s = {ds.repo_id: ds.tolerance_s for ds in datasets}
+        obj._datasets = datasets
+        obj.delta_timestamps = datasets[0].delta_timestamps if datasets else None
+        obj.image_transforms = image_transforms
+
+        # Disable features not common to all datasets
+        obj.disabled_features = set()
+        intersection_features = set(datasets[0].features)
+        for ds in datasets:
+            intersection_features.intersection_update(ds.features)
+        if len(intersection_features) == 0:
+            raise RuntimeError(
+                "Multiple datasets were provided but they had no keys common to all of them."
+            )
+        for ds in datasets:
+            extra_keys = set(ds.features).difference(intersection_features)
+            logging.warning(
+                f"keys {extra_keys} of {ds.repo_id} were disabled as they are not contained in all the "
+                "other datasets."
+            )
+            obj.disabled_features.update(extra_keys)
+
+        obj.stats = aggregate_stats([ds.meta.stats for ds in datasets])
+        obj._meta = obj._build_meta()
+        return obj
+
     def _build_meta(self):
         """Build a meta-compatible object for the training pipeline."""
 
