@@ -125,8 +125,22 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         # Multi-dataset support: build each dataset with its own FPS-appropriate delta_timestamps
         from lerobot.utils.constants import HF_LEROBOT_HOME
         from pathlib import Path
+        from torchvision.transforms import v2
 
         multi_root = Path(cfg.dataset.root) if cfg.dataset.root else HF_LEROBOT_HOME
+
+        # For multi-dataset, we must resize all images to a common size so they can be
+        # batched together (different datasets may have different resolutions).
+        # Use the policy's image_resolution if available (e.g. Pi0.5 = 224x224).
+        target_size = getattr(cfg.policy, "image_resolution", (224, 224))
+        if isinstance(target_size, int):
+            target_size = (target_size, target_size)
+        resize_tf = v2.Resize(list(target_size), antialias=True)
+        if image_transforms is not None:
+            multi_image_transforms = v2.Compose([resize_tf, image_transforms])
+        else:
+            multi_image_transforms = resize_tf
+
         pre_built_datasets = []
         for repo_id in cfg.dataset.repo_id:
             ds_meta = LeRobotDatasetMetadata(
@@ -138,7 +152,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 root=multi_root / repo_id,
                 episodes=cfg.dataset.episodes,
                 delta_timestamps=dt,
-                image_transforms=image_transforms,
+                image_transforms=multi_image_transforms,
                 revision=cfg.dataset.revision,
                 video_backend=cfg.dataset.video_backend,
                 tolerance_s=cfg.tolerance_s,
