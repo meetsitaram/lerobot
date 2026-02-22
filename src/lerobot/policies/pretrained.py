@@ -208,11 +208,18 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
         self,
         cfg: TrainPipelineConfig,
         peft_model=None,
+        upload_dtype=None,
     ):
+        import torch
+
         api = HfApi()
         repo_id = api.create_repo(
             repo_id=self.config.repo_id, private=self.config.private, exist_ok=True
         ).repo_id
+
+        # Default to bfloat16 for smaller uploads unless explicitly set
+        if upload_dtype is None:
+            upload_dtype = torch.bfloat16
 
         # Push the files to the repo in a single commit
         with TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
@@ -225,7 +232,27 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
                 peft_model.save_pretrained(saved_path)
                 self.config.save_pretrained(saved_path)
             else:
+                # Cast model to upload_dtype before saving to reduce model size
+                original_dtypes = {}
+                if upload_dtype is not None:
+                    for name, param in self.named_parameters():
+                        original_dtypes[name] = param.dtype
+                        param.data = param.data.to(upload_dtype)
+                    for name, buf in self.named_buffers():
+                        original_dtypes[f"buffer.{name}"] = buf.dtype
+                        buf.data = buf.data.to(upload_dtype)
+                    logging.info(f"Cast model to {upload_dtype} for Hub upload")
+
                 self.save_pretrained(saved_path)  # Calls _save_pretrained and stores model tensors
+
+                # Restore original dtypes so training can continue
+                if upload_dtype is not None:
+                    for name, param in self.named_parameters():
+                        if name in original_dtypes:
+                            param.data = param.data.to(original_dtypes[name])
+                    for name, buf in self.named_buffers():
+                        if f"buffer.{name}" in original_dtypes:
+                            buf.data = buf.data.to(original_dtypes[f"buffer.{name}"])
 
             card = self.generate_model_card(
                 cfg.dataset.repo_id, self.config.type, self.config.license, self.config.tags
